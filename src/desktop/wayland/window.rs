@@ -146,19 +146,14 @@ impl Window {
 
     /// Returns the geometry of this window.
     pub fn geometry(&self) -> Rectangle<i32, Logical> {
-        let bbox = self.bbox();
         if let Some(surface) = &self.wl_surface() {
-            // It's the set geometry clamped to the bounding box with the full bounding box as the fallback.
+            // It's the set geometry with the full bounding box as the fallback.
             with_states(surface, |states| {
-                states
-                    .cached_state
-                    .current::<SurfaceCachedState>()
-                    .geometry
-                    .and_then(|geo| geo.intersection(bbox))
+                states.cached_state.current::<SurfaceCachedState>().geometry
             })
-            .unwrap_or(bbox)
+            .unwrap_or_else(|| self.bbox())
         } else {
-            bbox
+            self.bbox()
         }
     }
 
