@@ -346,6 +346,10 @@ fn place_new_window(
     if let Some(toplevel) = window.0.toplevel() {
         toplevel.with_pending_state(|state| {
             state.bounds = Some(output_geometry.size);
+
+            state.size = Some(output_geometry.size); // size needs to be changed, otherwise the window always spawns as expected
+
+            // state.size = Some((50, 50).into()); // also does NOT work
         });
     }
 
@@ -357,7 +361,7 @@ fn place_new_window(
     let x = x_range.sample(&mut rng);
     let y = y_range.sample(&mut rng);
 
-    space.map_element(window.clone(), (x, y), activate);
+    space.map_element(window.clone(), (0, 0) /* (1, 1) works fine */, activate);
 }
 
 pub fn fixup_positions(space: &mut Space<WindowElement>, pointer_location: Point<f64, Logical>) {
