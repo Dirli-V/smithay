@@ -1,14 +1,17 @@
 use std::{
     os::unix::io::OwnedFd,
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
 
 use tracing::{info, warn};
 
 use smithay::{
-    backend::renderer::element::{
-        default_primary_scanout_output_compare, utils::select_dmabuf_feedback, RenderElementStates,
+    backend::{
+        input::TabletToolDescriptor,
+        renderer::element::{
+            default_primary_scanout_output_compare, utils::select_dmabuf_feedback, RenderElementStates,
+        },
     },
     delegate_compositor, delegate_data_control, delegate_data_device, delegate_fractional_scale,
     delegate_input_method_manager, delegate_keyboard_shortcuts_inhibit, delegate_layer_shell,
@@ -59,11 +62,11 @@ use smithay::{
         security_context::{
             SecurityContext, SecurityContextHandler, SecurityContextListenerSource, SecurityContextState,
         },
-        selection::data_device::{
-            set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
-            ServerDndGrabHandler,
-        },
         selection::{
+            data_device::{
+                set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
+                ServerDndGrabHandler,
+            },
             primary_selection::{set_primary_focus, PrimarySelectionHandler, PrimarySelectionState},
             wlr_data_control::{DataControlHandler, DataControlState},
             SelectionHandler,
@@ -77,7 +80,7 @@ use smithay::{
         },
         shm::{ShmHandler, ShmState},
         socket::ListeningSocketSource,
-        tablet_manager::{TabletManagerState, TabletSeatTrait},
+        tablet_manager::{TabletManagerState, TabletSeatHandler},
         text_input::TextInputManagerState,
         viewporter::ViewporterState,
         virtual_keyboard::VirtualKeyboardManagerState,
@@ -103,11 +106,6 @@ use smithay::{
     xwayland::{X11Wm, XWayland, XWaylandEvent},
 };
 
-pub struct CalloopData<BackendData: Backend + 'static> {
-    pub state: AnvilState<BackendData>,
-    pub display_handle: DisplayHandle,
-}
-
 #[derive(Debug, Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
@@ -126,7 +124,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub socket_name: Option<String>,
     pub display_handle: DisplayHandle,
     pub running: Arc<AtomicBool>,
-    pub handle: LoopHandle<'static, CalloopData<BackendData>>,
+    pub handle: LoopHandle<'static, AnvilState<BackendData>>,
 
     // desktop
     pub space: Space<WindowElement>,
@@ -154,7 +152,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
 
     // input-related fields
     pub suppressed_keys: Vec<Keysym>,
-    pub cursor_status: Arc<Mutex<CursorImageStatus>>,
+    pub cursor_status: CursorImageStatus,
     pub seat_name: String,
     pub seat: Seat<AnvilState<BackendData>>,
     pub clock: Clock<Monotonic>,
@@ -269,7 +267,7 @@ impl<BackendData: Backend> SeatHandler for AnvilState<BackendData> {
         set_primary_focus(dh, seat, focus);
     }
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        *self.cursor_status.lock().unwrap() = image;
+        self.cursor_status = image;
     }
 
     fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: LedState) {
@@ -278,6 +276,12 @@ impl<BackendData: Backend> SeatHandler for AnvilState<BackendData> {
 }
 delegate_seat!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
+impl<BackendData: Backend> TabletSeatHandler for AnvilState<BackendData> {
+    fn tablet_tool_image(&mut self, _tool: &TabletToolDescriptor, image: CursorImageStatus) {
+        // TODO: tablet tools should have their own cursors
+        self.cursor_status = image;
+    }
+}
 delegate_tablet_manager!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
 delegate_text_input_manager!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
@@ -525,7 +529,7 @@ smithay::delegate_xdg_foreign!(@<BackendData: Backend + 'static> AnvilState<Back
 impl<BackendData: Backend + 'static> AnvilState<BackendData> {
     pub fn init(
         display: Display<AnvilState<BackendData>>,
-        handle: LoopHandle<'static, CalloopData<BackendData>>,
+        handle: LoopHandle<'static, AnvilState<BackendData>>,
         backend_data: BackendData,
         listen_on_socket: bool,
     ) -> AnvilState<BackendData> {
@@ -559,7 +563,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                     profiling::scope!("dispatch_clients");
                     // Safety: we don't drop the display
                     unsafe {
-                        display.get_mut().dispatch_clients(&mut data.state).unwrap();
+                        display.get_mut().dispatch_clients(data).unwrap();
                     }
                     Ok(PostAction::Continue)
                 },
@@ -605,16 +609,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let seat_name = backend_data.seat_name();
         let mut seat = seat_state.new_wl_seat(&dh, seat_name.clone());
 
-        let cursor_status = Arc::new(Mutex::new(CursorImageStatus::default_named()));
         let pointer = seat.add_pointer();
         seat.add_keyboard(XkbConfig::default(), 200, 25)
             .expect("Failed to initialize the keyboard");
-
-        let cursor_status2 = cursor_status.clone();
-        seat.tablet_seat().on_cursor_surface(move |_tool, new_status| {
-            // TODO: tablet tools should have their own cursors
-            *cursor_status2.lock().unwrap() = new_status;
-        });
 
         let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(&dh);
 
@@ -631,7 +628,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                     client_fd: _,
                     display,
                 } => {
-                    let mut wm = X11Wm::start_wm(data.state.handle.clone(), dh.clone(), connection, client)
+                    let mut wm = X11Wm::start_wm(data.handle.clone(), dh.clone(), connection, client)
                         .expect("Failed to attach X11 Window Manager");
                     let cursor = Cursor::load();
                     let image = cursor.get_image(1, Duration::ZERO);
@@ -641,11 +638,11 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                         Point::from((image.xhot as u16, image.yhot as u16)),
                     )
                     .expect("Failed to set xwayland default cursor");
-                    data.state.xwm = Some(wm);
-                    data.state.xdisplay = Some(display);
+                    data.xwm = Some(wm);
+                    data.xdisplay = Some(display);
                 }
                 XWaylandEvent::Exited => {
-                    let _ = data.state.xwm.take();
+                    let _ = data.xwm.take();
                 }
             });
             if let Err(e) = ret {
@@ -680,7 +677,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             xdg_foreign_state,
             dnd_icon: None,
             suppressed_keys: Vec::new(),
-            cursor_status,
+            cursor_status: CursorImageStatus::default_named(),
             seat_name,
             seat,
             pointer,

@@ -291,7 +291,10 @@ pub trait XwmHandler {
         geometry: Rectangle<i32, Logical>,
         above: Option<X11Window>,
     );
-
+    /// A window property has changed.
+    fn property_notify(&mut self, xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+        let _ = (xwm, window, property);
+    }
     /// Window requests to be maximized.
     fn maximize_request(&mut self, xwm: XwmId, window: X11Surface) {
         let _ = (xwm, window);
@@ -469,6 +472,8 @@ struct OutgoingTransfer {
 
     property_set: bool,
     flush_property_on_delete: bool,
+    /// The final 0-byte data chunk has been sent, denoting the completion of this transfer
+    sent_finished: bool,
 }
 
 impl fmt::Debug for OutgoingTransfer {
@@ -488,6 +493,12 @@ impl fmt::Debug for OutgoingTransfer {
 impl OutgoingTransfer {
     fn flush_data(&mut self) -> Result<usize, ReplyOrIdError> {
         let len = std::cmp::min(self.source_data.len(), INCR_CHUNK_SIZE);
+
+        if len == 0 {
+            // This flush will complete the transfer
+            self.sent_finished = true;
+        }
+
         let mut data = self.source_data.split_off(len);
         std::mem::swap(&mut data, &mut self.source_data);
 
@@ -501,7 +512,6 @@ impl OutgoingTransfer {
         self.conn.flush()?;
 
         let remaining = self.source_data.len();
-        self.source_data = Vec::new();
         self.property_set = true;
         Ok(remaining)
     }
@@ -1335,7 +1345,7 @@ fn handle_event<D: XwmHandler + 'static>(
                     (geo.width as i32, geo.height as i32),
                 ),
             );
-            surface.update_properties(None)?;
+            surface.update_properties()?;
             xwm.windows.push(surface.clone());
 
             drop(_guard);
@@ -1962,6 +1972,7 @@ fn handle_event<D: XwmHandler + 'static>(
                             request: n,
                             property_set: false,
                             flush_property_on_delete: false,
+                            sent_finished: false,
                         };
                         selection.outgoing.push(transfer);
 
@@ -1976,10 +1987,6 @@ fn handle_event<D: XwmHandler + 'static>(
             }
         }
         Event::PropertyNotify(n) => {
-            if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window) {
-                surface.update_properties(Some(n.atom))?;
-            }
-
             if n.state == Property::NEW_VALUE && n.atom == xwm.atoms._WL_SELECTION {
                 if let Some(selection) = if xwm.clipboard.incoming.iter().any(|t| t.window == n.window) {
                     Some(&mut xwm.clipboard)
@@ -2063,8 +2070,10 @@ fn handle_event<D: XwmHandler + 'static>(
                         trace!(requestor, len, "Send data chunk");
 
                         if transfer.token.is_none() {
-                            if len > 0 {
-                                // Transfer is done, but we still have bytes left
+                            if len > 0 || !transfer.sent_finished {
+                                // Either the transfer is done, but we still have bytes left, or
+                                // all bytes have been transferred but the final 0-byte data chunk
+                                // hasn't been sent yet
                                 transfer.flush_property_on_delete = true;
                             } else if let Some(pos) = selection
                                 .outgoing
@@ -2076,6 +2085,13 @@ fn handle_event<D: XwmHandler + 'static>(
                             }
                         }
                     }
+                }
+            }
+
+            if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
+                if let Some(property) = surface.update_property(n.atom)? {
+                    drop(_guard);
+                    state.property_notify(xwm_id, surface, property);
                 }
             }
         }

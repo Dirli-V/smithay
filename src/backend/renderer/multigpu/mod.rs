@@ -472,6 +472,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                             // we only import the most recent set of damage here.
                             // If we need more on rendering - which we cannot know at this point - we will call import_missing later
                             // to receive the rest.
+                            // FIXME: We should be able to get rid of this allocation here
                             let buffer_damage = data.damage().take(1).flatten().cloned().fold(
                                 Vec::<Rectangle<i32, BufferCoords>>::new(),
                                 |damage, mut rect| {
@@ -1624,7 +1625,7 @@ where
             if let Some(sync) = sync {
                 if let Err(err) = self.frame.as_mut().unwrap().wait(&sync) {
                     trace!(?err, "Failed to import sync point, blocking");
-                    sync.wait();
+                    let _ = sync.wait(); // ignore interrupt errors
                 }
             }
             self.frame
@@ -1960,7 +1961,7 @@ where
     if let Some(sync) = existing_sync_point.take() {
         if let Err(err) = src_renderer.wait(&sync) {
             debug!(?err, "Unable to wait for existing sync_point, blocking..");
-            sync.wait();
+            let _ = sync.wait(); // ignore interrupt errors
         }
     }
     src_renderer.bind(shadow_buffer.clone()).map_err(Error::Render)?;
@@ -2177,7 +2178,10 @@ where
                     .map_err(Error::generalize::<T>)?;
                 external_shadow = slot.map(|(dmabuf, texture, sync_point)| {
                     if let Some(sync) = sync_point {
-                        src.renderer_mut().wait(&sync).unwrap_or_else(|_| sync.wait());
+                        // ignore interrupt errors
+                        src.renderer_mut().wait(&sync).unwrap_or_else(|_| {
+                            let _ = sync.wait();
+                        });
                     }
                     (dmabuf, texture)
                 });
@@ -2250,7 +2254,10 @@ where
                             .map_err(Error::generalize::<T>)?;
                         external_shadow = slot.map(|(dmabuf, texture, sync_point)| {
                             if let Some(sync) = sync_point {
-                                src.renderer_mut().wait(&sync).unwrap_or_else(|_| sync.wait());
+                                // ignore interrupt errors
+                                src.renderer_mut().wait(&sync).unwrap_or_else(|_| {
+                                    let _ = sync.wait();
+                                });
                             }
                             (dmabuf, texture as Box<dyn Any + 'static>)
                         });

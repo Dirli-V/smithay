@@ -93,6 +93,7 @@
 //! #         unimplemented!()
 //! #     }
 //! #     fn finish(self) -> Result<SyncPoint, Self::Error> { unimplemented!() }
+//! #     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> { unimplemented!() }
 //! # }
 //! #
 //! # #[derive(Debug)]
@@ -122,6 +123,7 @@
 //! #     {
 //! #         unimplemented!()
 //! #     }
+//! #     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> { unimplemented!() }
 //! # }
 //! #
 //! # impl ImportMem for FakeRenderer {
@@ -250,6 +252,7 @@
 //! #         unimplemented!()
 //! #     }
 //! #     fn finish(self) -> Result<SyncPoint, Self::Error> { unimplemented!() }
+//! #     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> { unimplemented!() }
 //! # }
 //! #
 //! # #[derive(Debug)]
@@ -279,6 +282,7 @@
 //! #     {
 //! #         unimplemented!()
 //! #     }
+//! #     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> { unimplemented!() }
 //! # }
 //! #
 //! # impl ImportMem for FakeRenderer {
@@ -406,7 +410,7 @@ use crate::{
     backend::{
         allocator::Fourcc,
         renderer::{
-            utils::{DamageBag, DamageSnapshot},
+            utils::{DamageBag, DamageSet, DamageSnapshot},
             Frame, ImportMem, Renderer, Texture,
         },
     },
@@ -633,12 +637,12 @@ pub struct TextureRenderElement<T> {
 }
 
 impl<T: Texture> TextureRenderElement<T> {
-    fn damage_since(&self, commit: Option<CommitCounter>) -> Vec<Rectangle<i32, Buffer>> {
+    fn damage_since(&self, commit: Option<CommitCounter>) -> DamageSet<i32, Buffer> {
         self.snapshot.damage_since(commit).unwrap_or_else(|| {
-            vec![Rectangle::from_loc_and_size(
+            DamageSet::from_slice(&[Rectangle::from_loc_and_size(
                 Point::default(),
                 self.texture.size(),
-            )]
+            )])
         })
     }
 }
@@ -830,11 +834,7 @@ where
             .to_buffer(self.scale as f64, self.transform, &size.to_f64())
     }
 
-    fn damage_since(
-        &self,
-        scale: Scale<f64>,
-        commit: Option<CommitCounter>,
-    ) -> Vec<Rectangle<i32, Physical>> {
+    fn damage_since(&self, scale: Scale<f64>, commit: Option<CommitCounter>) -> DamageSet<i32, Physical> {
         let src = self.src();
         let texture_size = self.texture.size();
         let physical_size = self.physical_size(scale);
@@ -851,7 +851,7 @@ where
                         rect.to_physical_precise_up(surface_scale * scale)
                     })
             })
-            .collect::<Vec<_>>()
+            .collect::<DamageSet<_, _>>()
     }
 
     fn opaque_regions(&self, scale: Scale<f64>) -> Vec<Rectangle<i32, Physical>> {

@@ -48,7 +48,7 @@ use smithay::{
 };
 use tracing::{error, info, warn};
 
-use crate::state::{post_repaint, take_presentation_feedback, AnvilState, Backend, CalloopData};
+use crate::state::{post_repaint, take_presentation_feedback, AnvilState, Backend};
 use crate::{drawing::*, render::*};
 
 pub const OUTPUT_NAME: &str = "winit";
@@ -234,9 +234,7 @@ pub fn run_winit() {
                 output.set_preferred(mode);
                 crate::shell::fixup_positions(&mut state.space, state.pointer.current_location());
             }
-            WinitEvent::Input(event) => {
-                state.process_input_event_windowed(&display_handle, event, OUTPUT_NAME)
-            }
+            WinitEvent::Input(event) => state.process_input_event_windowed(event, OUTPUT_NAME),
             _ => (),
         });
 
@@ -249,20 +247,18 @@ pub fn run_winit() {
         {
             let backend = &mut state.backend_data.backend;
 
-            let mut cursor_guard = state.cursor_status.lock().unwrap();
-
             // draw the cursor as relevant
             // reset the cursor if the surface is no longer alive
             let mut reset = false;
-            if let CursorImageStatus::Surface(ref surface) = *cursor_guard {
+            if let CursorImageStatus::Surface(ref surface) = state.cursor_status {
                 reset = !surface.alive();
             }
             if reset {
-                *cursor_guard = CursorImageStatus::default_named();
+                state.cursor_status = CursorImageStatus::default_named();
             }
-            let cursor_visible = !matches!(*cursor_guard, CursorImageStatus::Surface(_));
+            let cursor_visible = !matches!(state.cursor_status, CursorImageStatus::Surface(_));
 
-            pointer_element.set_status(cursor_guard.clone());
+            pointer_element.set_status(state.cursor_status.clone());
 
             #[cfg(feature = "debug")]
             let fps = state.backend_data.fps.avg().round() as u32;
@@ -278,7 +274,7 @@ pub fn run_winit() {
             let dnd_icon = state.dnd_icon.as_ref();
 
             let scale = Scale::from(output.current_scale().fractional_scale());
-            let cursor_hotspot = if let CursorImageStatus::Surface(ref surface) = *cursor_guard {
+            let cursor_hotspot = if let CursorImageStatus::Surface(ref surface) = state.cursor_status {
                 compositor::with_states(surface, |states| {
                     states
                         .data_map
@@ -361,7 +357,7 @@ pub fn run_winit() {
                 Ok(render_output_result) => {
                     let has_rendered = render_output_result.damage.is_some();
                     if let Some(damage) = render_output_result.damage {
-                        if let Err(err) = backend.submit(Some(&*damage)) {
+                        if let Err(err) = backend.submit(Some(damage)) {
                             warn!("Failed to submit buffer: {}", err);
                         }
                     }
@@ -430,16 +426,7 @@ pub fn run_winit() {
             }
         }
 
-        let mut calloop_data = CalloopData {
-            state,
-            display_handle,
-        };
-        let result = event_loop.dispatch(Some(Duration::from_millis(1)), &mut calloop_data);
-        CalloopData {
-            state,
-            display_handle,
-        } = calloop_data;
-
+        let result = event_loop.dispatch(Some(Duration::from_millis(1)), &mut state);
         if result.is_err() {
             state.running.store(false, Ordering::SeqCst);
         } else {

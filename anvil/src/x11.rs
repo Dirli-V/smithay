@@ -8,7 +8,7 @@ use std::{
 use crate::{
     drawing::*,
     render::*,
-    state::{post_repaint, take_presentation_feedback, AnvilState, Backend, CalloopData},
+    state::{post_repaint, take_presentation_feedback, AnvilState, Backend},
 };
 #[cfg(feature = "egl")]
 use smithay::backend::renderer::ImportEgl;
@@ -260,32 +260,29 @@ pub fn run_x11() {
         .handle()
         .insert_source(backend, move |event, _, data| match event {
             X11Event::CloseRequested { .. } => {
-                data.state.running.store(false, Ordering::SeqCst);
+                data.running.store(false, Ordering::SeqCst);
             }
             X11Event::Resized { new_size, .. } => {
                 let output = &output_clone;
                 let size = { (new_size.w as i32, new_size.h as i32).into() };
 
-                data.state.backend_data.mode = Mode {
+                data.backend_data.mode = Mode {
                     size,
                     refresh: 60_000,
                 };
                 output.delete_mode(output.current_mode().unwrap());
-                output.change_current_state(Some(data.state.backend_data.mode), None, None, None);
-                output.set_preferred(data.state.backend_data.mode);
-                crate::shell::fixup_positions(&mut data.state.space, data.state.pointer.current_location());
+                output.change_current_state(Some(data.backend_data.mode), None, None, None);
+                output.set_preferred(data.backend_data.mode);
+                crate::shell::fixup_positions(&mut data.space, data.pointer.current_location());
 
-                data.state.backend_data.render = true;
+                data.backend_data.render = true;
             }
             X11Event::PresentCompleted { .. } | X11Event::Refresh { .. } => {
-                data.state.backend_data.render = true;
+                data.backend_data.render = true;
             }
-            X11Event::Input(event) => {
-                data.state
-                    .process_input_event_windowed(&data.display_handle, event, OUTPUT_NAME)
-            }
+            X11Event::Input(event) => data.process_input_event_windowed(event, OUTPUT_NAME),
             X11Event::Focus(false) => {
-                data.state.release_all_keys();
+                data.release_all_keys();
             }
             _ => {}
         })
@@ -311,7 +308,6 @@ pub fn run_x11() {
 
             let backend_data = &mut state.backend_data;
             // We need to borrow everything we want to refer to inside the renderer callback otherwise rustc is unhappy.
-            let cursor_status = &state.cursor_status;
             #[cfg(feature = "debug")]
             let fps = backend_data.fps.avg().round() as u32;
             #[cfg(feature = "debug")]
@@ -332,22 +328,21 @@ pub fn run_x11() {
                 );
             }
 
-            let mut cursor_guard = cursor_status.lock().unwrap();
             let mut elements: Vec<CustomRenderElements<GlesRenderer>> = Vec::new();
 
             // draw the cursor as relevant
             // reset the cursor if the surface is no longer alive
             let mut reset = false;
-            if let CursorImageStatus::Surface(ref surface) = *cursor_guard {
+            if let CursorImageStatus::Surface(ref surface) = state.cursor_status {
                 reset = !surface.alive();
             }
             if reset {
-                *cursor_guard = CursorImageStatus::default_named();
+                state.cursor_status = CursorImageStatus::default_named();
             }
-            let cursor_visible = !matches!(*cursor_guard, CursorImageStatus::Surface(_));
+            let cursor_visible = !matches!(state.cursor_status, CursorImageStatus::Surface(_));
 
             let scale = Scale::from(output.current_scale().fractional_scale());
-            let cursor_hotspot = if let CursorImageStatus::Surface(ref surface) = *cursor_guard {
+            let cursor_hotspot = if let CursorImageStatus::Surface(ref surface) = state.cursor_status {
                 compositor::with_states(surface, |states| {
                     states
                         .data_map
@@ -363,7 +358,7 @@ pub fn run_x11() {
             let cursor_pos = state.pointer.current_location() - cursor_hotspot.to_f64();
             let cursor_pos_scaled = cursor_pos.to_physical(scale).to_i32_round();
 
-            pointer_element.set_status(cursor_guard.clone());
+            pointer_element.set_status(state.cursor_status.clone());
             elements.extend(pointer_element.render_elements(
                 &mut backend_data.renderer,
                 cursor_pos_scaled,
@@ -400,27 +395,13 @@ pub fn run_x11() {
             match render_res {
                 Ok(render_output_result) => {
                     trace!("Finished rendering");
-                    if let Err(err) = backend_data.surface.submit() {
+                    let submitted = if let Err(err) = backend_data.surface.submit() {
                         backend_data.surface.reset_buffers();
                         warn!("Failed to submit buffer: {}. Retrying", err);
+                        false
                     } else {
-                        state.backend_data.render = false;
+                        true
                     };
-
-                    #[cfg(feature = "debug")]
-                    if render_output_result.damage.is_some() {
-                        if let Some(renderdoc) = state.renderdoc.as_mut() {
-                            renderdoc.end_frame_capture(
-                                state.backend_data.renderer.egl_context().get_context_handle(),
-                                std::ptr::null(),
-                            );
-                        }
-                    } else if let Some(renderdoc) = state.renderdoc.as_mut() {
-                        renderdoc.discard_frame_capture(
-                            state.backend_data.renderer.egl_context().get_context_handle(),
-                            std::ptr::null(),
-                        );
-                    }
 
                     // Send frame events so that client start drawing their next frame
                     let time = state.clock.now();
@@ -439,6 +420,23 @@ pub fn run_x11() {
                             wp_presentation_feedback::Kind::Vsync,
                         )
                     }
+
+                    #[cfg(feature = "debug")]
+                    if render_output_result.damage.is_some() {
+                        if let Some(renderdoc) = state.renderdoc.as_mut() {
+                            renderdoc.end_frame_capture(
+                                state.backend_data.renderer.egl_context().get_context_handle(),
+                                std::ptr::null(),
+                            );
+                        }
+                    } else if let Some(renderdoc) = state.renderdoc.as_mut() {
+                        renderdoc.discard_frame_capture(
+                            state.backend_data.renderer.egl_context().get_context_handle(),
+                            std::ptr::null(),
+                        );
+                    }
+
+                    state.backend_data.render = !submitted;
                 }
                 Err(err) => {
                     #[cfg(feature = "debug")]
@@ -461,16 +459,7 @@ pub fn run_x11() {
             profiling::finish_frame!();
         }
 
-        let mut calloop_data = CalloopData {
-            state,
-            display_handle,
-        };
-        let result = event_loop.dispatch(Some(Duration::from_millis(16)), &mut calloop_data);
-        CalloopData {
-            state,
-            display_handle,
-        } = calloop_data;
-
+        let result = event_loop.dispatch(Some(Duration::from_millis(16)), &mut state);
         if result.is_err() {
             state.running.store(false, Ordering::SeqCst);
         } else {
