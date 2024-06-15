@@ -101,7 +101,7 @@ where
             .get::<RefCell<SeatData<D::SelectionUserData>>>()
             .unwrap()
             .borrow_mut();
-        if focus.as_ref().and_then(|(s, _)| s.wl_surface()) != self.current_focus.clone() {
+        if focus.as_ref().and_then(|(s, _)| s.wl_surface()).as_deref() != self.current_focus.as_ref() {
             // focus changed, we need to make a leave if appropriate
             if let Some(surface) = self.current_focus.take() {
                 for device in seat_data.known_data_devices() {
@@ -168,7 +168,7 @@ where
                     self.pending_offers.push(offer);
                 }
                 self.offer_data = Some(offer_data);
-                self.current_focus = Some(surface);
+                self.current_focus = Some(surface.into_owned());
             } else {
                 // make a move
                 for device in seat_data.known_data_devices() {
@@ -266,8 +266,7 @@ where
 
         if handle.current_pressed().is_empty() {
             // the user dropped, proceed to the drop
-            self.drop(data);
-            handle.unset_grab(data, serial, time, true);
+            handle.unset_grab(self, data, serial, time, true);
         }
     }
 
@@ -355,6 +354,10 @@ where
     fn start_data(&self) -> &PointerGrabStartData<D> {
         self.pointer_start_data.as_ref().unwrap()
     }
+
+    fn unset(&mut self, data: &mut D) {
+        self.drop(data);
+    }
 }
 
 impl<D> TouchGrab<D> for ServerDnDGrab<D>
@@ -387,8 +390,7 @@ where
         }
 
         // the user dropped, proceed to the drop
-        self.drop(data);
-        handle.unset_grab(data);
+        handle.unset_grab(self, data);
     }
 
     fn motion(
@@ -424,11 +426,33 @@ where
         _seq: Serial,
     ) {
         // TODO: should we cancel something here?
-        handle.unset_grab(data);
+        handle.unset_grab(self, data);
+    }
+
+    fn shape(
+        &mut self,
+        _data: &mut D,
+        _handle: &mut crate::input::touch::TouchInnerHandle<'_, D>,
+        _event: &crate::input::touch::ShapeEvent,
+        _seq: Serial,
+    ) {
+    }
+
+    fn orientation(
+        &mut self,
+        _data: &mut D,
+        _handle: &mut crate::input::touch::TouchInnerHandle<'_, D>,
+        _event: &crate::input::touch::OrientationEvent,
+        _seq: Serial,
+    ) {
     }
 
     fn start_data(&self) -> &TouchGrabStartData<D> {
         self.touch_start_data.as_ref().unwrap()
+    }
+
+    fn unset(&mut self, data: &mut D) {
+        self.drop(data);
     }
 }
 

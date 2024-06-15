@@ -66,7 +66,7 @@ pub trait XWaylandKeyboardGrabHandler: SeatHandler {
     /// has a keyboard.
     fn grab(&mut self, _surface: wl_surface::WlSurface, seat: Seat<Self>, grab: XWaylandKeyboardGrab<Self>) {
         if let Some(keyboard) = seat.get_keyboard() {
-            keyboard.set_grab(grab, SERIAL_COUNTER.next_serial());
+            keyboard.set_grab(self, grab, SERIAL_COUNTER.next_serial());
         }
     }
 
@@ -101,7 +101,7 @@ impl<D: XWaylandKeyboardGrabHandler + 'static> KeyboardGrab<D> for XWaylandKeybo
         handle.set_focus(data, self.start_data.focus.clone(), serial);
 
         if !self.grab.is_alive() {
-            handle.unset_grab(data, serial, false);
+            handle.unset_grab(self, data, serial, false);
         }
 
         handle.input(data, keycode, state, modifiers, serial, time)
@@ -115,7 +115,7 @@ impl<D: XWaylandKeyboardGrabHandler + 'static> KeyboardGrab<D> for XWaylandKeybo
         serial: Serial,
     ) {
         if !self.grab.is_alive() {
-            handle.unset_grab(data, serial, false);
+            handle.unset_grab(self, data, serial, false);
             handle.set_focus(data, focus, serial);
         }
     }
@@ -123,6 +123,8 @@ impl<D: XWaylandKeyboardGrabHandler + 'static> KeyboardGrab<D> for XWaylandKeybo
     fn start_data(&self) -> &keyboard::GrabStartData<D> {
         &self.start_data
     }
+
+    fn unset(&mut self, _data: &mut D) {}
 }
 
 /// State of the xwayland keyboard grab global

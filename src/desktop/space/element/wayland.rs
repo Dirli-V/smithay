@@ -23,6 +23,7 @@ impl SurfaceTree {
 }
 
 impl IsAlive for SurfaceTree {
+    #[inline]
     fn alive(&self) -> bool {
         self.surface.alive()
     }
@@ -31,7 +32,7 @@ impl IsAlive for SurfaceTree {
 impl<R> AsRenderElements<R> for SurfaceTree
 where
     R: Renderer + ImportAll,
-    <R as Renderer>::TextureId: 'static,
+    <R as Renderer>::TextureId: Clone + 'static,
 {
     type RenderElement = WaylandSurfaceRenderElement<R>;
 

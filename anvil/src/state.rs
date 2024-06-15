@@ -99,10 +99,11 @@ use crate::{
 };
 #[cfg(feature = "xwayland")]
 use smithay::{
-    delegate_xwayland_keyboard_grab,
+    delegate_xwayland_keyboard_grab, delegate_xwayland_shell,
     utils::{Point, Size},
     wayland::selection::{SelectionSource, SelectionTarget},
     wayland::xwayland_keyboard_grab::{XWaylandKeyboardGrabHandler, XWaylandKeyboardGrabState},
+    wayland::xwayland_shell,
     xwayland::{X11Wm, XWayland, XWaylandEvent},
 };
 
@@ -147,6 +148,8 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub presentation_state: PresentationState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
     pub xdg_foreign_state: XdgForeignState,
+    #[cfg(feature = "xwayland")]
+    pub xwayland_shell_state: xwayland_shell::XWaylandShellState,
 
     pub dnd_icon: Option<WlSurface>,
 
@@ -158,8 +161,6 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub clock: Clock<Monotonic>,
     pub pointer: PointerHandle<AnvilState<BackendData>>,
 
-    #[cfg(feature = "xwayland")]
-    pub xwayland: XWayland,
     #[cfg(feature = "xwayland")]
     pub xwm: Option<X11Wm>,
     #[cfg(feature = "xwayland")]
@@ -293,6 +294,8 @@ impl<BackendData: Backend> InputMethodHandler for AnvilState<BackendData> {
         }
     }
 
+    fn popup_repositioned(&mut self, _: PopupSurface) {}
+
     fn dismiss_popup(&mut self, surface: PopupSurface) {
         if let Some(parent) = surface.get_parent().map(|parent| parent.surface.clone()) {
             let _ = PopupManager::dismiss_popup(&parent, &PopupKind::from(surface));
@@ -302,7 +305,7 @@ impl<BackendData: Backend> InputMethodHandler for AnvilState<BackendData> {
     fn parent_geometry(&self, parent: &WlSurface) -> Rectangle<i32, smithay::utils::Logical> {
         self.space
             .elements()
-            .find_map(|window| (window.wl_surface().as_ref() == Some(parent)).then(|| window.geometry()))
+            .find_map(|window| (window.wl_surface().as_deref() == Some(parent)).then(|| window.geometry()))
             .unwrap_or_default()
     }
 }
@@ -331,7 +334,10 @@ delegate_relative_pointer!(@<BackendData: Backend + 'static> AnvilState<BackendD
 impl<BackendData: Backend> PointerConstraintsHandler for AnvilState<BackendData> {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
         // XXX region
-        if pointer.current_focus().and_then(|x| x.wl_surface()).as_ref() == Some(surface) {
+        let Some(current_focus) = pointer.current_focus() else {
+            return;
+        };
+        if current_focus.wl_surface().as_deref() == Some(surface) {
             with_pointer_constraint(surface, pointer, |constraint| {
                 constraint.unwrap().activate();
             });
@@ -371,7 +377,7 @@ impl<BackendData: Backend> XdgActivationHandler for AnvilState<BackendData> {
             let w = self
                 .space
                 .elements()
-                .find(|window| window.wl_surface().map(|s| s == surface).unwrap_or(false))
+                .find(|window| window.wl_surface().map(|s| *s == surface).unwrap_or(false))
                 .cloned();
             if let Some(window) = w {
                 self.space.raise_element(&window, true);
@@ -512,12 +518,15 @@ impl<BackendData: Backend + 'static> XWaylandKeyboardGrabHandler for AnvilState<
         let elem = self
             .space
             .elements()
-            .find(|elem| elem.wl_surface().as_ref() == Some(surface))?;
+            .find(|elem| elem.wl_surface().as_deref() == Some(surface))?;
         Some(KeyboardFocusTarget::Window(elem.0.clone()))
     }
 }
 #[cfg(feature = "xwayland")]
 delegate_xwayland_keyboard_grab!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
+
+#[cfg(feature = "xwayland")]
+delegate_xwayland_shell!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
 impl<BackendData: Backend> XdgForeignHandler for AnvilState<BackendData> {
     fn xdg_foreign_state(&mut self) -> &mut XdgForeignState {
@@ -616,40 +625,10 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(&dh);
 
         #[cfg(feature = "xwayland")]
-        let xwayland = {
-            XWaylandKeyboardGrabState::new::<Self>(&dh);
+        let xwayland_shell_state = xwayland_shell::XWaylandShellState::new::<Self>(&dh.clone());
 
-            let (xwayland, channel) = XWayland::new(&dh);
-            let dh = dh.clone();
-            let ret = handle.insert_source(channel, move |event, _, data| match event {
-                XWaylandEvent::Ready {
-                    connection,
-                    client,
-                    client_fd: _,
-                    display,
-                } => {
-                    let mut wm = X11Wm::start_wm(data.handle.clone(), dh.clone(), connection, client)
-                        .expect("Failed to attach X11 Window Manager");
-                    let cursor = Cursor::load();
-                    let image = cursor.get_image(1, Duration::ZERO);
-                    wm.set_cursor(
-                        &image.pixels_rgba,
-                        Size::from((image.width as u16, image.height as u16)),
-                        Point::from((image.xhot as u16, image.yhot as u16)),
-                    )
-                    .expect("Failed to set xwayland default cursor");
-                    data.xwm = Some(wm);
-                    data.xdisplay = Some(display);
-                }
-                XWaylandEvent::Exited => {
-                    let _ = data.xwm.take();
-                }
-            });
-            if let Err(e) = ret {
-                tracing::error!("Failed to insert the XWaylandSource into the event loop: {}", e);
-            }
-            xwayland
-        };
+        #[cfg(feature = "xwayland")]
+        XWaylandKeyboardGrabState::new::<Self>(&dh.clone());
 
         AnvilState {
             backend_data,
@@ -682,8 +661,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             seat,
             pointer,
             clock,
+
             #[cfg(feature = "xwayland")]
-            xwayland,
+            xwayland_shell_state,
             #[cfg(feature = "xwayland")]
             xwm: None,
             #[cfg(feature = "xwayland")]
@@ -691,6 +671,51 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             #[cfg(feature = "debug")]
             renderdoc: renderdoc::RenderDoc::new().ok(),
             show_window_preview: false,
+        }
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub fn start_xwayland(&mut self) {
+        use std::process::Stdio;
+
+        let (xwayland, client) = XWayland::spawn(
+            &self.display_handle,
+            None,
+            std::iter::empty::<(String, String)>(),
+            true,
+            Stdio::null(),
+            Stdio::null(),
+            |_| (),
+        )
+        .expect("failed to start XWayland");
+
+        let ret = self
+            .handle
+            .insert_source(xwayland, move |event, _, data| match event {
+                XWaylandEvent::Ready {
+                    x11_socket,
+                    display_number,
+                } => {
+                    let mut wm = X11Wm::start_wm(data.handle.clone(), x11_socket, client.clone())
+                        .expect("Failed to attach X11 Window Manager");
+
+                    let cursor = Cursor::load();
+                    let image = cursor.get_image(1, Duration::ZERO);
+                    wm.set_cursor(
+                        &image.pixels_rgba,
+                        Size::from((image.width as u16, image.height as u16)),
+                        Point::from((image.xhot as u16, image.yhot as u16)),
+                    )
+                    .expect("Failed to set xwayland default cursor");
+                    data.xwm = Some(wm);
+                    data.xdisplay = Some(display_number);
+                }
+                XWaylandEvent::Error => {
+                    warn!("XWayland crashed on startup");
+                }
+            });
+        if let Err(e) = ret {
+            tracing::error!("Failed to insert the XWaylandSource into the event loop: {}", e);
         }
     }
 }

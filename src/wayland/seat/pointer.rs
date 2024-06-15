@@ -1,15 +1,7 @@
 use std::{fmt, sync::Mutex};
 
-use wayland_protocols::wp::{
-    pointer_gestures::zv1::server::{
-        zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1,
-        zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1,
-        zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1,
-    },
-    relative_pointer::zv1::server::zwp_relative_pointer_v1::ZwpRelativePointerV1,
-};
 use wayland_server::{
-    backend::ClientId,
+    backend::{ClientId, ObjectId},
     protocol::{
         wl_pointer::{
             self, Axis as WlAxis, AxisSource as WlAxisSource, ButtonState as WlButtonState, Request,
@@ -31,10 +23,8 @@ use crate::{
         },
         Seat,
     },
-    utils::{Serial, SERIAL_COUNTER},
-    wayland::{
-        compositor, pointer_constraints::with_pointer_constraint, pointer_gestures::PointerGestureUserData,
-    },
+    utils::Serial,
+    wayland::{compositor, pointer_constraints::with_pointer_constraint},
 };
 
 use super::{SeatHandler, SeatState, WaylandFocus};
@@ -46,196 +36,53 @@ struct V120UserData {
     y: i32,
 }
 
-impl<D: SeatHandler> PointerHandle<D> {
-    pub(crate) fn new_pointer(&self, pointer: WlPointer) {
-        let mut guard = self.known_pointers.lock().unwrap();
-        guard.push(pointer);
-    }
-
-    pub(crate) fn new_relative_pointer(&self, pointer: ZwpRelativePointerV1) {
-        let mut guard = self.known_relative_pointers.lock().unwrap();
-        guard.push(pointer);
-    }
-
-    pub(crate) fn new_swipe_gesture(&self, gesture: ZwpPointerGestureSwipeV1) {
-        let mut guard = self.known_swipe_gestures.lock().unwrap();
-        guard.push(gesture);
-    }
-
-    pub(crate) fn new_pinch_gesture(&self, gesture: ZwpPointerGesturePinchV1) {
-        let mut guard = self.known_pinch_gestures.lock().unwrap();
-        guard.push(gesture);
-    }
-
-    pub(crate) fn new_hold_gesture(&self, gesture: ZwpPointerGestureHoldV1) {
-        let mut guard = self.known_hold_gestures.lock().unwrap();
-        guard.push(gesture);
-    }
-}
-
 /// WlSurface role of a cursor image icon
 pub const CURSOR_IMAGE_ROLE: &str = "cursor_image";
 
-fn for_each_focused_pointers<D: SeatHandler + 'static>(
-    seat: &Seat<D>,
-    surface: &WlSurface,
-    mut f: impl FnMut(WlPointer),
-) {
-    if let Some(pointer) = seat.get_pointer() {
-        let inner = pointer.known_pointers.lock().unwrap();
-        for ptr in &*inner {
-            if ptr.id().same_client_as(&surface.id()) {
-                f(ptr.clone())
-            }
-        }
-    }
+#[derive(Debug, Default)]
+pub(crate) struct WlPointerHandle {
+    pub(crate) last_enter: Mutex<Option<Serial>>,
+    known_pointers: Mutex<Vec<WlPointer>>,
 }
 
-fn for_each_focused_relative_pointers<D: SeatHandler + 'static>(
-    seat: &Seat<D>,
-    surface: &WlSurface,
-    mut f: impl FnMut(ZwpRelativePointerV1),
-) {
-    if let Some(pointer) = seat.get_pointer() {
-        let inner = pointer.known_relative_pointers.lock().unwrap();
-        for ptr in &*inner {
-            if ptr.id().same_client_as(&surface.id()) {
-                f(ptr.clone())
-            }
-        }
+impl WlPointerHandle {
+    pub(super) fn new_pointer(&self, pointer: WlPointer) {
+        self.known_pointers.lock().unwrap().push(pointer);
     }
-}
 
-fn for_each_focused_swipe_gestures<D: SeatHandler + 'static>(
-    seat: &Seat<D>,
-    surface: &WlSurface,
-    mut f: impl FnMut(ZwpPointerGestureSwipeV1),
-) {
-    if let Some(pointer) = seat.get_pointer() {
-        let inner = pointer.known_swipe_gestures.lock().unwrap();
-        for ptr in &*inner {
-            if ptr.id().same_client_as(&surface.id()) {
-                f(ptr.clone())
-            }
-        }
-    }
-}
+    fn enter(&self, surface: &WlSurface, event: &MotionEvent) {
+        *self.last_enter.lock().unwrap() = Some(event.serial);
 
-fn for_each_focused_pinch_gestures<D: SeatHandler + 'static>(
-    seat: &Seat<D>,
-    surface: &WlSurface,
-    mut f: impl FnMut(ZwpPointerGesturePinchV1),
-) {
-    if let Some(pointer) = seat.get_pointer() {
-        let inner = pointer.known_pinch_gestures.lock().unwrap();
-        for ptr in &*inner {
-            if ptr.id().same_client_as(&surface.id()) {
-                f(ptr.clone())
-            }
-        }
-    }
-}
-
-fn for_each_focused_hold_gestures<D: SeatHandler + 'static>(
-    seat: &Seat<D>,
-    surface: &WlSurface,
-    mut f: impl FnMut(ZwpPointerGestureHoldV1),
-) {
-    if let Some(pointer) = seat.get_pointer() {
-        let inner = pointer.known_hold_gestures.lock().unwrap();
-        for ptr in &*inner {
-            if ptr.id().same_client_as(&surface.id()) {
-                f(ptr.clone())
-            }
-        }
-    }
-}
-
-#[cfg(feature = "wayland_frontend")]
-impl<D> PointerTarget<D> for WlSurface
-where
-    D: SeatHandler + 'static,
-{
-    fn enter(&self, seat: &Seat<D>, _data: &mut D, event: &MotionEvent) {
-        let serial = event.serial;
-        if let Some(pointer) = seat.get_pointer() {
-            *pointer.last_enter.lock().unwrap() = Some(serial);
-        }
-        for_each_focused_pointers(seat, self, |ptr| {
-            ptr.enter(serial.into(), self, event.location.x, event.location.y);
+        self.for_each_focused_pointer(surface, |ptr| {
+            ptr.enter(event.serial.into(), surface, event.location.x, event.location.y);
         })
     }
-    fn leave(&self, seat: &Seat<D>, _data: &mut D, serial: Serial, time: u32) {
-        for_each_focused_swipe_gestures(seat, self, |gesture| {
-            let data = gesture.data::<PointerGestureUserData<D>>().unwrap();
-            let ongoing = data.in_progress_on.lock().unwrap().take();
-            if ongoing.is_some() {
-                // Cancel the ongoing gesture.
-                gesture.end(serial.into(), time, 1);
-            }
-        });
-        for_each_focused_pinch_gestures(seat, self, |gesture| {
-            let data = gesture.data::<PointerGestureUserData<D>>().unwrap();
-            let ongoing = data.in_progress_on.lock().unwrap().take();
-            if ongoing.is_some() {
-                // Cancel the ongoing gesture.
-                gesture.end(serial.into(), time, 1);
-            }
-        });
-        for_each_focused_hold_gestures(seat, self, |gesture| {
-            let data = gesture.data::<PointerGestureUserData<D>>().unwrap();
-            let ongoing = data.in_progress_on.lock().unwrap().take();
-            if ongoing.is_some() {
-                // Cancel the ongoing gesture.
-                gesture.end(serial.into(), time, 1);
-            }
-        });
-        for_each_focused_pointers(seat, self, |ptr| {
-            ptr.leave(serial.into(), self);
+
+    fn leave(&self, surface: &WlSurface, serial: Serial, _time: u32) {
+        self.for_each_focused_pointer(surface, |ptr| {
+            ptr.leave(serial.into(), surface);
             if ptr.version() >= 5 {
                 ptr.frame();
             }
         });
-        if let Some(pointer) = seat.get_pointer() {
-            *pointer.last_enter.lock().unwrap() = None;
-            with_pointer_constraint(self, &pointer, |constraint| {
-                if let Some(constraint) = constraint {
-                    constraint.deactivate();
-                }
-            });
-        }
-        compositor::with_states(self, |states| {
-            if let Some(data) = states.data_map.get::<Mutex<V120UserData>>() {
-                *data.lock().unwrap() = Default::default();
-            }
-        });
+
+        *self.last_enter.lock().unwrap() = None;
     }
-    fn motion(&self, seat: &Seat<D>, _data: &mut D, event: &MotionEvent) {
-        for_each_focused_pointers(seat, self, |ptr| {
+
+    fn motion(&self, surface: &WlSurface, event: &MotionEvent) {
+        self.for_each_focused_pointer(surface, |ptr| {
             ptr.motion(event.time, event.location.x, event.location.y);
         })
     }
-    fn relative_motion(&self, seat: &Seat<D>, _data: &mut D, event: &RelativeMotionEvent) {
-        for_each_focused_relative_pointers(seat, self, |ptr| {
-            let utime_hi = (event.utime >> 32) as u32;
-            let utime_lo = (event.utime & 0xffffffff) as u32;
-            ptr.relative_motion(
-                utime_hi,
-                utime_lo,
-                event.delta.x,
-                event.delta.y,
-                event.delta_unaccel.x,
-                event.delta_unaccel.y,
-            );
-        })
-    }
-    fn button(&self, seat: &Seat<D>, _data: &mut D, event: &ButtonEvent) {
-        for_each_focused_pointers(seat, self, |ptr| {
+
+    fn button(&self, surface: &WlSurface, event: &ButtonEvent) {
+        self.for_each_focused_pointer(surface, |ptr| {
             ptr.button(event.serial.into(), event.time, event.button, event.state.into());
         })
     }
-    fn axis(&self, seat: &Seat<D>, _data: &mut D, details: AxisFrame) {
-        for_each_focused_pointers(seat, self, |ptr| {
+
+    fn axis(&self, surface: &WlSurface, details: AxisFrame) {
+        self.for_each_focused_pointer(surface, |ptr| {
             if ptr.version() >= 5 {
                 // axis source
                 if let Some(source) = details.source {
@@ -262,7 +109,7 @@ where
                             ptr.axis_value120(WlAxis::VerticalScroll, y);
                         }
                     } else {
-                        compositor::with_states(self, |states| {
+                        compositor::with_states(surface, |states| {
                             let mut data = states
                                 .data_map
                                 .get_or_insert_threadsafe(Mutex::<V120UserData>::default)
@@ -287,7 +134,7 @@ where
                 if details.stop.0 {
                     ptr.axis_stop(details.time, WlAxis::HorizontalScroll);
 
-                    compositor::with_states(self, |states| {
+                    compositor::with_states(surface, |states| {
                         if let Some(data) = states.data_map.get::<Mutex<V120UserData>>() {
                             data.lock().unwrap().x = 0;
                         }
@@ -296,7 +143,7 @@ where
                 if details.stop.1 {
                     ptr.axis_stop(details.time, WlAxis::VerticalScroll);
 
-                    compositor::with_states(self, |states| {
+                    compositor::with_states(surface, |states| {
                         if let Some(data) = states.data_map.get::<Mutex<V120UserData>>() {
                             data.lock().unwrap().y = 0;
                         }
@@ -322,133 +169,129 @@ where
         })
     }
 
-    fn frame(&self, seat: &Seat<D>, _data: &mut D) {
-        for_each_focused_pointers(seat, self, |ptr| {
+    fn frame(&self, surface: &WlSurface) {
+        self.for_each_focused_pointer(surface, |ptr| {
             if ptr.version() >= 5 {
                 ptr.frame();
             }
         });
     }
 
-    fn gesture_swipe_begin(&self, seat: &Seat<D>, _data: &mut D, event: &GestureSwipeBeginEvent) {
-        for_each_focused_swipe_gestures(seat, self, |gesture| {
-            let data = gesture.data::<PointerGestureUserData<D>>().unwrap();
-            let ongoing = data.in_progress_on.lock().unwrap().replace(self.clone());
-            if ongoing.is_some() {
-                // Cancel an ongoing gesture for a different surface.
-                gesture.end(event.serial.into(), event.time, 1);
+    fn for_each_focused_pointer(&self, surface: &WlSurface, mut f: impl FnMut(WlPointer)) {
+        let inner = self.known_pointers.lock().unwrap();
+        for ptr in &*inner {
+            if ptr.id().same_client_as(&surface.id()) {
+                f(ptr.clone())
             }
-            gesture.begin(event.serial.into(), event.time, self, event.fingers);
-        })
+        }
+    }
+}
+
+impl<D> PointerTarget<D> for WlSurface
+where
+    D: SeatHandler + 'static,
+{
+    fn enter(&self, seat: &Seat<D>, _data: &mut D, event: &MotionEvent) {
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wl_pointer.enter(self, event);
+        }
+    }
+
+    fn leave(&self, seat: &Seat<D>, _data: &mut D, serial: Serial, time: u32) {
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wp_pointer_gestures.leave::<D>(self, serial, time);
+            pointer.wl_pointer.leave(self, serial, time);
+
+            with_pointer_constraint(self, &pointer, |constraint| {
+                if let Some(constraint) = constraint {
+                    constraint.deactivate();
+                }
+            });
+        }
+
+        compositor::with_states(self, |states| {
+            if let Some(data) = states.data_map.get::<Mutex<V120UserData>>() {
+                *data.lock().unwrap() = Default::default();
+            }
+        });
+    }
+
+    fn motion(&self, seat: &Seat<D>, _data: &mut D, event: &MotionEvent) {
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wl_pointer.motion(self, event);
+        }
+    }
+
+    fn relative_motion(&self, seat: &Seat<D>, _data: &mut D, event: &RelativeMotionEvent) {
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wp_relative.relative_motion(self, event);
+        }
+    }
+
+    fn button(&self, seat: &Seat<D>, _data: &mut D, event: &ButtonEvent) {
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wl_pointer.button(self, event);
+        }
+    }
+
+    fn axis(&self, seat: &Seat<D>, _data: &mut D, details: AxisFrame) {
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wl_pointer.axis(self, details);
+        }
+    }
+
+    fn frame(&self, seat: &Seat<D>, _data: &mut D) {
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wl_pointer.frame(self);
+        }
+    }
+
+    fn gesture_swipe_begin(&self, seat: &Seat<D>, _data: &mut D, event: &GestureSwipeBeginEvent) {
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wp_pointer_gestures.gesture_swipe_begin::<D>(self, event);
+        }
     }
 
     fn gesture_swipe_update(&self, seat: &Seat<D>, _data: &mut D, event: &GestureSwipeUpdateEvent) {
-        for_each_focused_swipe_gestures(seat, self, |gesture| {
-            let data = gesture.data::<PointerGestureUserData<D>>().unwrap();
-            let mut ongoing = data.in_progress_on.lock().unwrap();
-            // Check that the ongoing gesture is for this surface.
-            if ongoing.as_ref() == Some(self) {
-                gesture.update(event.time, event.delta.x, event.delta.y);
-            } else if ongoing.take().is_some() {
-                // If it was for a different surface, cancel it.
-                gesture.end(SERIAL_COUNTER.next_serial().into(), event.time, 1);
-            }
-        })
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wp_pointer_gestures.gesture_swipe_update::<D>(self, event);
+        }
     }
 
     fn gesture_swipe_end(&self, seat: &Seat<D>, _data: &mut D, event: &GestureSwipeEndEvent) {
-        for_each_focused_swipe_gestures(seat, self, |gesture| {
-            let data = gesture.data::<PointerGestureUserData<D>>().unwrap();
-            let ongoing = data.in_progress_on.lock().unwrap().take();
-            // Check if the gesture was ongoing.
-            if ongoing.is_some() {
-                let cancelled = if ongoing.as_ref() == Some(self) {
-                    event.cancelled
-                } else {
-                    // If the gesture was ongoing for any other surface then cancel it.
-                    true
-                };
-                gesture.end(event.serial.into(), event.time, cancelled.into());
-            }
-        })
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wp_pointer_gestures.gesture_swipe_end::<D>(self, event);
+        }
     }
 
     fn gesture_pinch_begin(&self, seat: &Seat<D>, _data: &mut D, event: &GesturePinchBeginEvent) {
-        for_each_focused_pinch_gestures(seat, self, |gesture| {
-            let data = gesture.data::<PointerGestureUserData<D>>().unwrap();
-            let ongoing = data.in_progress_on.lock().unwrap().replace(self.clone());
-            if ongoing.is_some() {
-                // Cancel an ongoing gesture for a different surface.
-                gesture.end(event.serial.into(), event.time, 1);
-            }
-            gesture.begin(event.serial.into(), event.time, self, event.fingers);
-        })
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wp_pointer_gestures.gesture_pinch_begin::<D>(self, event);
+        }
     }
 
     fn gesture_pinch_update(&self, seat: &Seat<D>, _data: &mut D, event: &GesturePinchUpdateEvent) {
-        for_each_focused_pinch_gestures(seat, self, |gesture| {
-            let data = gesture.data::<PointerGestureUserData<D>>().unwrap();
-            let mut ongoing = data.in_progress_on.lock().unwrap();
-            // Check that the ongoing gesture is for this surface.
-            if ongoing.as_ref() == Some(self) {
-                gesture.update(
-                    event.time,
-                    event.delta.x,
-                    event.delta.y,
-                    event.scale,
-                    event.rotation,
-                );
-            } else if ongoing.take().is_some() {
-                // If it was for a different surface, cancel it.
-                gesture.end(SERIAL_COUNTER.next_serial().into(), event.time, 1);
-            }
-        })
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wp_pointer_gestures.gesture_pinch_update::<D>(self, event);
+        }
     }
 
     fn gesture_pinch_end(&self, seat: &Seat<D>, _data: &mut D, event: &GesturePinchEndEvent) {
-        for_each_focused_pinch_gestures(seat, self, |gesture| {
-            let data = gesture.data::<PointerGestureUserData<D>>().unwrap();
-            let ongoing = data.in_progress_on.lock().unwrap().take();
-            // Check if the gesture was ongoing.
-            if ongoing.is_some() {
-                let cancelled = if ongoing.as_ref() == Some(self) {
-                    event.cancelled
-                } else {
-                    // If the gesture was ongoing for any other surface then cancel it.
-                    true
-                };
-                gesture.end(event.serial.into(), event.time, cancelled.into());
-            }
-        })
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wp_pointer_gestures.gesture_pinch_end::<D>(self, event);
+        }
     }
 
     fn gesture_hold_begin(&self, seat: &Seat<D>, _data: &mut D, event: &GestureHoldBeginEvent) {
-        for_each_focused_hold_gestures(seat, self, |gesture| {
-            let data = gesture.data::<PointerGestureUserData<D>>().unwrap();
-            let ongoing = data.in_progress_on.lock().unwrap().replace(self.clone());
-            if ongoing.is_some() {
-                // Cancel an ongoing gesture for a different surface.
-                gesture.end(event.serial.into(), event.time, 1);
-            }
-            gesture.begin(event.serial.into(), event.time, self, event.fingers);
-        })
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wp_pointer_gestures.gesture_hold_begin::<D>(self, event);
+        }
     }
 
     fn gesture_hold_end(&self, seat: &Seat<D>, _data: &mut D, event: &GestureHoldEndEvent) {
-        for_each_focused_hold_gestures(seat, self, |gesture| {
-            let data = gesture.data::<PointerGestureUserData<D>>().unwrap();
-            let ongoing = data.in_progress_on.lock().unwrap().take();
-            // Check if the gesture was ongoing.
-            if ongoing.is_some() {
-                let cancelled = if ongoing.as_ref() == Some(self) {
-                    event.cancelled
-                } else {
-                    // If the gesture was ongoing for any other surface then cancel it.
-                    true
-                };
-                gesture.end(event.serial.into(), event.time, cancelled.into());
-            }
-        })
+        if let Some(pointer) = seat.get_pointer() {
+            pointer.wp_pointer_gestures.gesture_hold_end::<D>(self, event);
+        }
     }
 }
 
@@ -493,28 +336,7 @@ where
                     None => return,
                 };
 
-                if !handle
-                    .last_enter
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|last_serial| last_serial.0 == serial)
-                    .unwrap_or(false)
-                {
-                    return; // Ignore mismatches in serial
-                }
-
-                // Only allow setting the cursor icon if the current pointer focus is of the same
-                // client.
-                if !handle
-                    .inner
-                    .lock()
-                    .unwrap()
-                    .focus
-                    .as_ref()
-                    .map(|(focus, _)| focus.same_client_as(&pointer.id()))
-                    .unwrap_or(false)
-                {
+                if !allow_setting_cursor(handle, Serial(serial), &pointer.id()) {
                     return;
                 }
 
@@ -569,6 +391,7 @@ where
     fn destroyed(_state: &mut D, _: ClientId, pointer: &WlPointer, data: &PointerUserData<D>) {
         if let Some(ref handle) = data.handle {
             handle
+                .wl_pointer
                 .known_pointers
                 .lock()
                 .unwrap()
@@ -578,6 +401,7 @@ where
 }
 
 impl From<Axis> for WlAxis {
+    #[inline]
     fn from(axis: Axis) -> WlAxis {
         match axis {
             Axis::Horizontal => WlAxis::HorizontalScroll,
@@ -592,6 +416,7 @@ pub struct UnknownAxis(WlAxis);
 
 impl TryFrom<WlAxis> for Axis {
     type Error = UnknownAxis;
+    #[inline]
     fn try_from(value: WlAxis) -> Result<Self, Self::Error> {
         match value {
             WlAxis::HorizontalScroll => Ok(Axis::Horizontal),
@@ -602,6 +427,7 @@ impl TryFrom<WlAxis> for Axis {
 }
 
 impl From<AxisSource> for WlAxisSource {
+    #[inline]
     fn from(axis: AxisSource) -> WlAxisSource {
         match axis {
             AxisSource::Wheel => WlAxisSource::Wheel,
@@ -613,6 +439,7 @@ impl From<AxisSource> for WlAxisSource {
 }
 
 impl From<ButtonState> for WlButtonState {
+    #[inline]
     fn from(state: ButtonState) -> WlButtonState {
         match state {
             ButtonState::Pressed => WlButtonState::Pressed,
@@ -627,6 +454,7 @@ pub struct UnknownButtonState(WlButtonState);
 
 impl TryFrom<WlButtonState> for ButtonState {
     type Error = UnknownButtonState;
+    #[inline]
     fn try_from(value: WlButtonState) -> Result<Self, Self::Error> {
         match value {
             WlButtonState::Pressed => Ok(ButtonState::Pressed),
@@ -634,4 +462,40 @@ impl TryFrom<WlButtonState> for ButtonState {
             x => Err(UnknownButtonState(x)),
         }
     }
+}
+
+pub(crate) fn allow_setting_cursor<D>(handle: &PointerHandle<D>, serial: Serial, object_id: &ObjectId) -> bool
+where
+    D: SeatHandler + 'static,
+    <D as SeatHandler>::PointerFocus: WaylandFocus,
+{
+    // Allow client if there is a pointer grab for that client. Like drag and drop.
+    if handle
+        .grab_start_data()
+        .and_then(|data| data.focus)
+        .map_or(false, |focus| focus.0.same_client_as(object_id))
+    {
+        return true;
+    }
+
+    if !handle
+        .wl_pointer
+        .last_enter
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(false, |last_serial| *last_serial == serial)
+    {
+        return false; // Ignore mismatches in serial
+    }
+
+    // Only allow setting the cursor icon if the current pointer focus is of the same
+    // client.
+    handle
+        .inner
+        .lock()
+        .unwrap()
+        .focus
+        .as_ref()
+        .map_or(false, |(focus, _)| focus.same_client_as(object_id))
 }

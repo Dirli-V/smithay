@@ -110,7 +110,7 @@ where
             .get::<RefCell<SeatData<D::SelectionUserData>>>()
             .unwrap()
             .borrow_mut();
-        if focus.as_ref().and_then(|(s, _)| s.wl_surface()) != self.current_focus.clone() {
+        if focus.as_ref().and_then(|(s, _)| s.wl_surface()).as_deref() != self.current_focus.as_ref() {
             // focus changed, we need to make a leave if appropriate
             if let Some(surface) = self.current_focus.take() {
                 // only leave if there is a data source or we are on the original client
@@ -145,6 +145,7 @@ where
                         active: true,
                         dropped: false,
                         accepted: true,
+                        finished: false,
                         chosen_action: DndAction::empty(),
                     }));
                     for device in seat_data
@@ -190,7 +191,7 @@ where
                         }
                     }
                 }
-                self.current_focus = Some(surface);
+                self.current_focus = Some(surface.into_owned());
             } else {
                 // make a move
                 if self.data_source.is_some() || self.origin.id().same_client_as(&surface.id()) {
@@ -291,8 +292,7 @@ where
     fn button(&mut self, data: &mut D, handle: &mut PointerInnerHandle<'_, D>, event: &ButtonEvent) {
         if handle.current_pressed().is_empty() {
             // the user dropped, proceed to the drop
-            self.drop(data);
-            handle.unset_grab(data, event.serial, event.time, true);
+            handle.unset_grab(self, data, event.serial, event.time, true);
         }
     }
 
@@ -380,6 +380,10 @@ where
     fn start_data(&self) -> &PointerGrabStartData<D> {
         self.pointer_start_data.as_ref().unwrap()
     }
+
+    fn unset(&mut self, data: &mut D) {
+        self.drop(data);
+    }
 }
 
 impl<D> TouchGrab<D> for DnDGrab<D>
@@ -411,8 +415,7 @@ where
             return;
         }
 
-        self.drop(data);
-        handle.unset_grab(data);
+        handle.unset_grab(self, data);
     }
 
     fn motion(
@@ -445,11 +448,33 @@ where
         _seq: crate::utils::Serial,
     ) {
         // TODO: should we cancel something here?
-        handle.unset_grab(data);
+        handle.unset_grab(self, data);
+    }
+
+    fn shape(
+        &mut self,
+        _data: &mut D,
+        _handle: &mut crate::input::touch::TouchInnerHandle<'_, D>,
+        _event: &crate::input::touch::ShapeEvent,
+        _seq: Serial,
+    ) {
+    }
+
+    fn orientation(
+        &mut self,
+        _data: &mut D,
+        _handle: &mut crate::input::touch::TouchInnerHandle<'_, D>,
+        _event: &crate::input::touch::OrientationEvent,
+        _seq: Serial,
+    ) {
     }
 
     fn start_data(&self) -> &TouchGrabStartData<D> {
         self.touch_start_data.as_ref().unwrap()
+    }
+
+    fn unset(&mut self, data: &mut D) {
+        self.drop(data);
     }
 }
 
@@ -458,6 +483,7 @@ struct OfferData {
     active: bool,
     dropped: bool,
     accepted: bool,
+    finished: bool,
     chosen_action: DndAction,
 }
 
@@ -527,7 +553,11 @@ where
                 source.send(mime_type, fd.as_fd());
             }
         }
-        Request::Destroy => {}
+        Request::Destroy => {
+            if source.version() >= 3 && data.dropped && !data.finished {
+                source.cancelled();
+            }
+        }
         Request::Finish => {
             if !data.active {
                 offer.post_error(
@@ -559,6 +589,7 @@ where
             }
             source.dnd_finished();
             data.active = false;
+            data.finished = true;
         }
         Request::SetActions {
             dnd_actions,

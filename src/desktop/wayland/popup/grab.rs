@@ -20,7 +20,7 @@ use crate::{
         },
         SeatHandler,
     },
-    utils::{DeadResource, IsAlive, Logical, Point, Serial},
+    utils::{DeadResource, IsAlive, Logical, Point, Serial, SERIAL_COUNTER},
     wayland::{compositor::get_role, seat::WaylandFocus, shell::xdg::XDG_POPUP_ROLE},
 };
 
@@ -355,7 +355,7 @@ where
         let root_surface = self.root.wl_surface()?;
         self.toplevel_grab
             .ungrab(&root_surface, strategy)
-            .or(Some(root_surface))
+            .or(Some(root_surface.into_owned()))
     }
 
     /// Convenience method for getting a [`KeyboardGrabStartData`] for this grab.
@@ -382,7 +382,7 @@ where
                 && (keyboard.has_grab(self.serial)
                     || keyboard.has_grab(self.previous_serial.unwrap_or(self.serial)))
             {
-                keyboard.unset_grab();
+                keyboard.unset_grab(data);
                 keyboard.set_focus(data, Some(self.root.clone()), serial);
             }
         }
@@ -455,7 +455,7 @@ where
         }
 
         if self.popup_grab.has_ended() {
-            handle.unset_grab(data, serial, false);
+            handle.unset_grab(self, data, serial, false);
         }
 
         handle.input(data, keycode, state, modifiers, serial, time)
@@ -471,7 +471,7 @@ where
         // Ignore focus changes unless the grab has ended
         if self.popup_grab.has_ended() {
             handle.set_focus(data, focus, serial);
-            handle.unset_grab(data, serial, false);
+            handle.unset_grab(self, data, serial, false);
             return;
         }
 
@@ -486,6 +486,8 @@ where
     fn start_data(&self) -> &KeyboardGrabStartData<D> {
         self.popup_grab.keyboard_grab_start_data()
     }
+
+    fn unset(&mut self, _data: &mut D) {}
 }
 
 /// Default implementation of a [`PointerGrab`] for [`PopupGrab`]
@@ -551,8 +553,7 @@ where
         event: &MotionEvent,
     ) {
         if self.popup_grab.has_ended() {
-            handle.unset_grab(data, event.serial, event.time, true);
-            self.popup_grab.unset_keyboard_grab(data, event.serial);
+            handle.unset_grab(self, data, event.serial, event.time, true);
             return;
         }
 
@@ -591,9 +592,8 @@ where
         let state = event.state;
 
         if self.popup_grab.has_ended() {
-            handle.unset_grab(data, serial, time, true);
+            handle.unset_grab(self, data, serial, time, true);
             handle.button(data, event);
-            self.popup_grab.unset_keyboard_grab(data, serial);
             return;
         }
 
@@ -610,9 +610,8 @@ where
                 .unwrap_or(false)
         {
             let _ = self.popup_grab.ungrab(PopupUngrabStrategy::All);
-            handle.unset_grab(data, serial, time, true);
+            handle.unset_grab(self, data, serial, time, true);
             handle.button(data, event);
-            self.popup_grab.unset_keyboard_grab(data, serial);
             return;
         }
 
@@ -701,5 +700,10 @@ where
 
     fn start_data(&self) -> &PointerGrabStartData<D> {
         self.popup_grab.pointer_grab_start_data()
+    }
+
+    fn unset(&mut self, data: &mut D) {
+        let serial = SERIAL_COUNTER.next_serial();
+        self.popup_grab.unset_keyboard_grab(data, serial);
     }
 }

@@ -45,6 +45,7 @@
 //! are not, for example).
 //!
 
+pub mod alpha_modifier;
 pub mod buffer;
 pub mod compositor;
 pub mod content_type;
@@ -77,3 +78,5 @@ pub mod xdg_activation;
 pub mod xdg_foreign;
 #[cfg(feature = "xwayland")]
 pub mod xwayland_keyboard_grab;
+#[cfg(feature = "xwayland")]
+pub mod xwayland_shell;

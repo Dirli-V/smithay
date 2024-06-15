@@ -9,10 +9,9 @@ use tracing::{info_span, instrument};
 use crate::backend::input::TouchSlot;
 use crate::utils::{IsAlive, Logical, Point, Serial, SerialCounter};
 
-use self::grab::GrabStatus;
 pub use grab::{DefaultGrab, GrabStartData, TouchDownGrab, TouchGrab};
 
-use super::{Seat, SeatHandler};
+use super::{GrabStatus, Seat, SeatHandler};
 
 mod grab;
 
@@ -51,6 +50,7 @@ impl<D: SeatHandler> fmt::Debug for TouchHandle<D> {
 }
 
 impl<D: SeatHandler> Clone for TouchHandle<D> {
+    #[inline]
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -62,12 +62,14 @@ impl<D: SeatHandler> Clone for TouchHandle<D> {
 }
 
 impl<D: SeatHandler> std::hash::Hash for TouchHandle<D> {
+    #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         Arc::as_ptr(&self.inner).hash(state)
     }
 }
 
 impl<D: SeatHandler> std::cmp::PartialEq for TouchHandle<D> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -79,11 +81,12 @@ pub(crate) struct TouchInternal<D: SeatHandler> {
     focus: HashMap<TouchSlot, TouchSlotState<D>>,
     seq_counter: SerialCounter,
     default_grab: Box<dyn Fn() -> Box<dyn TouchGrab<D>> + Send + 'static>,
-    grab: GrabStatus<D>,
+    grab: GrabStatus<dyn TouchGrab<D>>,
 }
 
 struct TouchSlotState<D: SeatHandler> {
     focus: Option<(<D as SeatHandler>::TouchFocus, Point<i32, Logical>)>,
+    frame_pending: Option<<D as SeatHandler>::TouchFocus>,
     pending: Serial,
     current: Option<Serial>,
 }
@@ -92,6 +95,7 @@ impl<D: SeatHandler> fmt::Debug for TouchSlotState<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TouchSlotState")
             .field("focus", &self.focus)
+            .field("frame_pending", &self.frame_pending)
             .field("pending", &self.pending)
             .field("current", &self.current)
             .finish()
@@ -280,7 +284,7 @@ impl<D: SeatHandler + 'static> TouchHandle<D> {
         let mut inner = self.inner.lock().unwrap();
         let seat = self.get_seat(data);
         let seq = inner.seq_counter.next_serial();
-        inner.with_grab(&seat, |handle, grab| {
+        inner.with_grab(data, &seat, |data, handle, grab| {
             grab.down(data, handle, focus, event, seq);
         });
     }
@@ -290,7 +294,7 @@ impl<D: SeatHandler + 'static> TouchHandle<D> {
         let mut inner = self.inner.lock().unwrap();
         let seat = self.get_seat(data);
         let seq = inner.seq_counter.next_serial();
-        inner.with_grab(&seat, |handle, grab| {
+        inner.with_grab(data, &seat, |data, handle, grab| {
             grab.up(data, handle, event, seq);
         });
     }
@@ -316,7 +320,7 @@ impl<D: SeatHandler + 'static> TouchHandle<D> {
         let mut inner = self.inner.lock().unwrap();
         let seat = self.get_seat(data);
         let seq = inner.seq_counter.next_serial();
-        inner.with_grab(&seat, |handle, grab| {
+        inner.with_grab(data, &seat, |data, handle, grab| {
             grab.motion(data, handle, focus, event, seq);
         });
     }
@@ -328,7 +332,7 @@ impl<D: SeatHandler + 'static> TouchHandle<D> {
         let mut inner = self.inner.lock().unwrap();
         let seat = self.get_seat(data);
         let seq = inner.seq_counter.next_serial();
-        inner.with_grab(&seat, |handle, grab| {
+        inner.with_grab(data, &seat, |data, handle, grab| {
             grab.frame(data, handle, seq);
         });
     }
@@ -342,8 +346,28 @@ impl<D: SeatHandler + 'static> TouchHandle<D> {
         let mut inner = self.inner.lock().unwrap();
         let seat = self.get_seat(data);
         let seq = inner.seq_counter.next_serial();
-        inner.with_grab(&seat, |handle, grab| {
+        inner.with_grab(data, &seat, |data, handle, grab| {
             grab.cancel(data, handle, seq);
+        });
+    }
+
+    /// Notify that a touch point has changed its shape.
+    pub fn shape(&self, data: &mut D, event: &ShapeEvent) {
+        let mut inner = self.inner.lock().unwrap();
+        let seat = self.get_seat(data);
+        let seq = inner.seq_counter.next_serial();
+        inner.with_grab(data, &seat, |data, handle, grab| {
+            grab.shape(data, handle, event, seq);
+        });
+    }
+
+    /// Notify that a touch point has changed its orientation.
+    pub fn orientation(&self, data: &mut D, event: &OrientationEvent) {
+        let mut inner = self.inner.lock().unwrap();
+        let seat = self.get_seat(data);
+        let seq = inner.seq_counter.next_serial();
+        inner.with_grab(data, &seat, |data, handle, grab| {
+            grab.orientation(data, handle, event, seq);
         });
     }
 
@@ -378,7 +402,14 @@ impl<'a, D: SeatHandler + 'static> TouchInnerHandle<'a, D> {
     /// Change the current grab on this pointer to the provided grab
     ///
     /// Overwrites any current grab.
-    pub fn set_grab<G: TouchGrab<D> + 'static>(&mut self, data: &mut D, serial: Serial, grab: G) {
+    pub fn set_grab<G: TouchGrab<D> + 'static>(
+        &mut self,
+        handler: &mut dyn TouchGrab<D>,
+        data: &mut D,
+        serial: Serial,
+        grab: G,
+    ) {
+        handler.unset(data);
         self.inner.set_grab(data, self.seat, serial, grab);
     }
 
@@ -386,7 +417,8 @@ impl<'a, D: SeatHandler + 'static> TouchInnerHandle<'a, D> {
     ///
     /// This will also restore the focus of the underlying pointer if restore_focus
     /// is [`true`]
-    pub fn unset_grab(&mut self, data: &mut D) {
+    pub fn unset_grab(&mut self, handler: &mut dyn TouchGrab<D>, data: &mut D) {
+        handler.unset(data);
         self.inner.unset_grab(data, self.seat);
     }
 
@@ -442,6 +474,16 @@ impl<'a, D: SeatHandler + 'static> TouchInnerHandle<'a, D> {
         self.inner.frame(data, self.seat, seq)
     }
 
+    /// Notify that a touch point has changed its shape.
+    pub fn shape(&mut self, data: &mut D, event: &ShapeEvent, seq: Serial) {
+        self.inner.shape(data, self.seat, event, seq)
+    }
+
+    /// Notify that a touch point has changed its orientation.
+    pub fn orientation(&mut self, data: &mut D, event: &OrientationEvent, seq: Serial) {
+        self.inner.orientation(data, self.seat, event, seq)
+    }
+
     /// Notify that the touch session has been cancelled.
     ///
     /// Use in case you decide the touch stream is a global gesture.
@@ -467,15 +509,21 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
 
     fn set_grab<G: TouchGrab<D> + 'static>(
         &mut self,
-        _data: &mut D,
+        data: &mut D,
         _seat: &Seat<D>,
         serial: Serial,
         grab: G,
     ) {
+        if let GrabStatus::Active(_, handler) = &mut self.grab {
+            handler.unset(data);
+        }
         self.grab = GrabStatus::Active(serial, Box::new(grab));
     }
 
-    fn unset_grab(&mut self, _data: &mut D, _seat: &Seat<D>) {
+    fn unset_grab(&mut self, data: &mut D, _seat: &Seat<D>) {
+        if let GrabStatus::Active(_, handler) = &mut self.grab {
+            handler.unset(data);
+        }
         self.grab = GrabStatus::None;
     }
 
@@ -491,10 +539,12 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
             .entry(event.slot)
             .and_modify(|state| {
                 state.pending = seq;
-                state.focus = focus.clone();
+                state.frame_pending = None;
+                state.focus.clone_from(&focus);
             })
             .or_insert_with(|| TouchSlotState {
                 focus,
+                frame_pending: None,
                 pending: seq,
                 current: None,
             });
@@ -513,6 +563,10 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
         state.pending = seq;
         if let Some((focus, _)) = state.focus.take() {
             focus.up(seat, data, event, seq);
+
+            // Keep the focus around to be able to send a frame event after up, but move
+            // it out of the current focus to prevent sending other events.
+            state.frame_pending = Some(focus);
         }
     }
 
@@ -541,6 +595,12 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
                 continue;
             }
             state.current = Some(seq);
+
+            // Send the frame event for any stored focus in the up handler
+            if let Some(focus) = state.frame_pending.take() {
+                focus.frame(seat, data, seq);
+            }
+
             if let Some((focus, _)) = state.focus.as_ref() {
                 focus.frame(seat, data, seq);
             }
@@ -559,9 +619,29 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
         }
     }
 
-    fn with_grab<F>(&mut self, seat: &Seat<D>, f: F)
+    fn shape(&mut self, data: &mut D, seat: &Seat<D>, event: &ShapeEvent, seq: Serial) {
+        let Some(state) = self.focus.get_mut(&event.slot) else {
+            return;
+        };
+        state.pending = seq;
+        if let Some((focus, _)) = state.focus.as_ref() {
+            focus.shape(seat, data, event, seq);
+        }
+    }
+
+    fn orientation(&mut self, data: &mut D, seat: &Seat<D>, event: &OrientationEvent, seq: Serial) {
+        let Some(state) = self.focus.get_mut(&event.slot) else {
+            return;
+        };
+        state.pending = seq;
+        if let Some((focus, _)) = state.focus.as_ref() {
+            focus.orientation(seat, data, event, seq);
+        }
+    }
+
+    fn with_grab<F>(&mut self, data: &mut D, seat: &Seat<D>, f: F)
     where
-        F: FnOnce(&mut TouchInnerHandle<'_, D>, &mut dyn TouchGrab<D>),
+        F: FnOnce(&mut D, &mut TouchInnerHandle<'_, D>, &mut dyn TouchGrab<D>),
     {
         let mut grab = std::mem::replace(&mut self.grab, GrabStatus::Borrowed);
         match grab {
@@ -570,17 +650,26 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
                 // If this grab is associated with a surface that is no longer alive, discard it
                 if let Some((ref focus, _)) = handler.start_data().focus {
                     if !focus.alive() {
+                        handler.unset(data);
                         self.grab = GrabStatus::None;
                         let mut default_grab = (self.default_grab)();
-                        f(&mut TouchInnerHandle { inner: self, seat }, &mut *default_grab);
+                        f(
+                            data,
+                            &mut TouchInnerHandle { inner: self, seat },
+                            &mut *default_grab,
+                        );
                         return;
                     }
                 }
-                f(&mut TouchInnerHandle { inner: self, seat }, &mut **handler);
+                f(data, &mut TouchInnerHandle { inner: self, seat }, &mut **handler);
             }
             GrabStatus::None => {
                 let mut default_grab = (self.default_grab)();
-                f(&mut TouchInnerHandle { inner: self, seat }, &mut *default_grab);
+                f(
+                    data,
+                    &mut TouchInnerHandle { inner: self, seat },
+                    &mut *default_grab,
+                );
             }
         }
 

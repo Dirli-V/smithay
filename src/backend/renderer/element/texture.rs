@@ -84,6 +84,7 @@
 //! #         _: Rectangle<f64, Buffer>,
 //! #         _: Rectangle<i32, Physical>,
 //! #         _: &[Rectangle<i32, Physical>],
+//! #         _: &[Rectangle<i32, Physical>],
 //! #         _: Transform,
 //! #         _: f32,
 //! #     ) -> Result<(), Self::Error> {
@@ -242,6 +243,7 @@
 //! #         _: &Self::TextureId,
 //! #         _: Rectangle<f64, Buffer>,
 //! #         _: Rectangle<i32, Physical>,
+//! #         _: &[Rectangle<i32, Physical>],
 //! #         _: &[Rectangle<i32, Physical>],
 //! #         _: Transform,
 //! #         _: f32,
@@ -410,7 +412,7 @@ use crate::{
     backend::{
         allocator::Fourcc,
         renderer::{
-            utils::{DamageBag, DamageSet, DamageSnapshot},
+            utils::{DamageBag, DamageSet, DamageSnapshot, OpaqueRegions},
             Frame, ImportMem, Renderer, Texture,
         },
     },
@@ -854,9 +856,9 @@ where
             .collect::<DamageSet<_, _>>()
     }
 
-    fn opaque_regions(&self, scale: Scale<f64>) -> Vec<Rectangle<i32, Physical>> {
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         if self.alpha < 1.0 {
-            return Vec::new();
+            return OpaqueRegions::default();
         }
 
         let src = self.src();
@@ -876,7 +878,7 @@ where
                                 rect.to_physical_precise_up(surface_scale * scale)
                             })
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<OpaqueRegions<_, _>>()
             })
             .unwrap_or_default()
     }
@@ -903,12 +905,21 @@ where
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), <R as Renderer>::Error> {
         if frame.id() != self.renderer_id {
             warn!("trying to render texture from different renderer");
             return Ok(());
         }
 
-        frame.render_texture_from_to(&self.texture, src, dst, damage, self.transform, self.alpha)
+        frame.render_texture_from_to(
+            &self.texture,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            self.transform,
+            self.alpha,
+        )
     }
 }

@@ -24,8 +24,8 @@ use crate::{
     state::{AnvilState, Backend},
 };
 
-pub struct PointerMoveSurfaceGrab<B: Backend + 'static> {
-    pub start_data: PointerGrabStartData<AnvilState<B>>,
+pub struct PointerMoveSurfaceGrab<BackendData: Backend + 'static> {
+    pub start_data: PointerGrabStartData<AnvilState<BackendData>>,
     pub window: WindowElement,
     pub initial_window_location: Point<i32, Logical>,
 }
@@ -67,7 +67,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
         handle.button(data, event);
         if handle.current_pressed().is_empty() {
             // No more buttons are pressed, release the grab.
-            handle.unset_grab(data, event.serial, event.time, true);
+            handle.unset_grab(self, data, event.serial, event.time, true);
         }
     }
 
@@ -163,10 +163,12 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
     fn start_data(&self) -> &PointerGrabStartData<AnvilState<BackendData>> {
         &self.start_data
     }
+
+    fn unset(&mut self, _data: &mut AnvilState<BackendData>) {}
 }
 
-pub struct TouchMoveSurfaceGrab<B: Backend + 'static> {
-    pub start_data: TouchGrabStartData<AnvilState<B>>,
+pub struct TouchMoveSurfaceGrab<BackendData: Backend + 'static> {
+    pub start_data: TouchGrabStartData<AnvilState<BackendData>>,
     pub window: WindowElement,
     pub initial_window_location: Point<i32, Logical>,
 }
@@ -197,7 +199,7 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
         }
 
         handle.up(data, event, seq);
-        handle.unset_grab(data);
+        handle.unset_grab(self, data);
     }
 
     fn motion(
@@ -236,12 +238,34 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
         seq: Serial,
     ) {
         handle.cancel(data, seq);
-        handle.unset_grab(data);
+        handle.unset_grab(self, data);
+    }
+
+    fn shape(
+        &mut self,
+        data: &mut AnvilState<BackendData>,
+        handle: &mut smithay::input::touch::TouchInnerHandle<'_, AnvilState<BackendData>>,
+        event: &smithay::input::touch::ShapeEvent,
+        seq: Serial,
+    ) {
+        handle.shape(data, event, seq);
+    }
+
+    fn orientation(
+        &mut self,
+        data: &mut AnvilState<BackendData>,
+        handle: &mut smithay::input::touch::TouchInnerHandle<'_, AnvilState<BackendData>>,
+        event: &smithay::input::touch::OrientationEvent,
+        seq: Serial,
+    ) {
+        handle.orientation(data, event, seq);
     }
 
     fn start_data(&self) -> &smithay::input::touch::GrabStartData<AnvilState<BackendData>> {
         &self.start_data
     }
+
+    fn unset(&mut self, _data: &mut AnvilState<BackendData>) {}
 }
 
 bitflags::bitflags! {
@@ -275,6 +299,7 @@ impl From<ResizeEdge> for xdg_toplevel::ResizeEdge {
 
 #[cfg(feature = "xwayland")]
 impl From<X11ResizeEdge> for ResizeEdge {
+    #[inline]
     fn from(edge: X11ResizeEdge) -> Self {
         match edge {
             X11ResizeEdge::Bottom => ResizeEdge::BOTTOM,
@@ -314,8 +339,8 @@ pub enum ResizeState {
     WaitingForCommit(ResizeData),
 }
 
-pub struct PointerResizeSurfaceGrab<B: Backend + 'static> {
-    pub start_data: PointerGrabStartData<AnvilState<B>>,
+pub struct PointerResizeSurfaceGrab<BackendData: Backend + 'static> {
+    pub start_data: PointerGrabStartData<AnvilState<BackendData>>,
     pub window: WindowElement,
     pub edges: ResizeEdge,
     pub initial_window_location: Point<i32, Logical>,
@@ -336,7 +361,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
 
         // It is impossible to get `min_size` and `max_size` of dead toplevel, so we return early.
         if !self.window.alive() {
-            handle.unset_grab(data, event.serial, event.time, true);
+            handle.unset_grab(self, data, event.serial, event.time, true);
             return;
         }
 
@@ -427,7 +452,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
         handle.button(data, event);
         if handle.current_pressed().is_empty() {
             // No more buttons are pressed, release the grab.
-            handle.unset_grab(data, event.serial, event.time, true);
+            handle.unset_grab(self, data, event.serial, event.time, true);
 
             // If toplevel is dead, we can't resize it, so we return early.
             if !self.window.alive() {
@@ -603,10 +628,12 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
     fn start_data(&self) -> &PointerGrabStartData<AnvilState<BackendData>> {
         &self.start_data
     }
+
+    fn unset(&mut self, _data: &mut AnvilState<BackendData>) {}
 }
 
-pub struct TouchResizeSurfaceGrab<B: Backend + 'static> {
-    pub start_data: TouchGrabStartData<AnvilState<B>>,
+pub struct TouchResizeSurfaceGrab<BackendData: Backend + 'static> {
+    pub start_data: TouchGrabStartData<AnvilState<BackendData>>,
     pub window: WindowElement,
     pub edges: ResizeEdge,
     pub initial_window_location: Point<i32, Logical>,
@@ -638,7 +665,7 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
         if event.slot != self.start_data.slot {
             return;
         }
-        handle.unset_grab(data);
+        handle.unset_grab(self, data);
 
         // If toplevel is dead, we can't resize it, so we return early.
         if !self.window.alive() {
@@ -738,7 +765,7 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
 
         // It is impossible to get `min_size` and `max_size` of dead toplevel, so we return early.
         if !self.window.alive() {
-            handle.unset_grab(data);
+            handle.unset_grab(self, data);
             return;
         }
 
@@ -825,10 +852,32 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
         seq: Serial,
     ) {
         handle.cancel(data, seq);
-        handle.unset_grab(data);
+        handle.unset_grab(self, data);
+    }
+
+    fn shape(
+        &mut self,
+        data: &mut AnvilState<BackendData>,
+        handle: &mut smithay::input::touch::TouchInnerHandle<'_, AnvilState<BackendData>>,
+        event: &smithay::input::touch::ShapeEvent,
+        seq: Serial,
+    ) {
+        handle.shape(data, event, seq);
+    }
+
+    fn orientation(
+        &mut self,
+        data: &mut AnvilState<BackendData>,
+        handle: &mut smithay::input::touch::TouchInnerHandle<'_, AnvilState<BackendData>>,
+        event: &smithay::input::touch::OrientationEvent,
+        seq: Serial,
+    ) {
+        handle.orientation(data, event, seq);
     }
 
     fn start_data(&self) -> &smithay::input::touch::GrabStartData<AnvilState<BackendData>> {
         &self.start_data
     }
+
+    fn unset(&mut self, _data: &mut AnvilState<BackendData>) {}
 }

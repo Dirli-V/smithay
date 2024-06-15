@@ -87,6 +87,7 @@ pub struct Mode {
 
 #[cfg(feature = "backend_drm")]
 impl From<DrmMode> for Mode {
+    #[inline]
     fn from(mode: DrmMode) -> Self {
         let clock = mode.clock() as u64;
         let htotal = mode.hsync().2 as u64;
@@ -140,6 +141,7 @@ pub enum Subpixel {
 
 #[cfg(feature = "backend_drm")]
 impl From<DrmSubPixel> for Subpixel {
+    #[inline]
     fn from(mode: DrmSubPixel) -> Self {
         match mode {
             DrmSubPixel::Unknown => Self::Unknown,
@@ -416,6 +418,20 @@ impl Output {
             inner: Arc::downgrade(&self.inner),
         }
     }
+
+    /// Cleanup some internal resource.
+    ///
+    /// Needs to be called periodically, at best before every
+    /// wayland socket flush.
+    ///
+    /// Note: [`Space::refresh`](crate::desktop::space::Space) already calls this
+    /// function internally. So in case you already use the desktop module you can
+    /// skip calling this function explicitly.
+    #[profiling::function]
+    pub fn cleanup(&self) {
+        #[cfg(feature = "wayland_frontend")]
+        self.cleanup_surfaces();
+    }
 }
 
 impl PartialEq for Output {
@@ -439,6 +455,12 @@ impl WeakOutput {
     #[inline]
     pub fn upgrade(&self) -> Option<Output> {
         self.inner.upgrade().map(|inner| Output { inner })
+    }
+
+    /// Check if the output is still alive
+    #[inline]
+    pub fn is_alive(&self) -> bool {
+        self.inner.strong_count() != 0
     }
 }
 

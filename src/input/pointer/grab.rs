@@ -3,7 +3,6 @@ use std::fmt;
 use crate::{
     backend::input::ButtonState,
     input::SeatHandler,
-    utils::Serial,
     utils::{Logical, Point},
 };
 
@@ -167,6 +166,8 @@ pub trait PointerGrab<D: SeatHandler>: Send {
     );
     /// The data about the event that started the grab.
     fn start_data(&self) -> &GrabStartData<D>;
+    /// The grab has been unset or replaced with another grab.
+    fn unset(&mut self, data: &mut D);
 }
 
 /// Data about the event that started the grab.
@@ -201,23 +202,6 @@ impl<D: SeatHandler + 'static> Clone for GrabStartData<D> {
     }
 }
 
-pub(super) enum GrabStatus<D> {
-    None,
-    Active(Serial, Box<dyn PointerGrab<D>>),
-    Borrowed,
-}
-
-// PointerGrab is a trait, so we have to impl Debug manually
-impl<D> fmt::Debug for GrabStatus<D> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            GrabStatus::None => f.debug_tuple("GrabStatus::None").finish(),
-            GrabStatus::Active(serial, _) => f.debug_tuple("GrabStatus::Active").field(&serial).finish(),
-            GrabStatus::Borrowed => f.debug_tuple("GrabStatus::Borrowed").finish(),
-        }
-    }
-}
-
 // The default grab, the behavior when no particular grab is in progress
 pub(super) struct DefaultGrab;
 
@@ -246,6 +230,7 @@ impl<D: SeatHandler + 'static> PointerGrab<D> for DefaultGrab {
         handle.button(data, event);
         if event.state == ButtonState::Pressed {
             handle.set_grab(
+                self,
                 data,
                 event.serial,
                 Focus::Keep,
@@ -343,6 +328,8 @@ impl<D: SeatHandler + 'static> PointerGrab<D> for DefaultGrab {
     fn start_data(&self) -> &GrabStartData<D> {
         unreachable!()
     }
+
+    fn unset(&mut self, _data: &mut D) {}
 }
 
 // A click grab, basic grab started when an user clicks a surface
@@ -379,7 +366,7 @@ impl<D: SeatHandler + 'static> PointerGrab<D> for ClickGrab<D> {
         handle.button(data, event);
         if handle.current_pressed().is_empty() {
             // no more buttons are pressed, release the grab
-            handle.unset_grab(data, event.serial, event.time, false);
+            handle.unset_grab(self, data, event.serial, event.time, false);
         }
     }
 
@@ -466,4 +453,6 @@ impl<D: SeatHandler + 'static> PointerGrab<D> for ClickGrab<D> {
     fn start_data(&self) -> &GrabStartData<D> {
         &self.start_data
     }
+
+    fn unset(&mut self, _data: &mut D) {}
 }

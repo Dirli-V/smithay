@@ -3,7 +3,7 @@
 use crate::{
     backend::renderer::{
         element::{Element, Id, Kind, RenderElement, UnderlyingStorage},
-        utils::CommitCounter,
+        utils::{CommitCounter, OpaqueRegions},
     },
     utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform},
 };
@@ -89,7 +89,7 @@ impl Element for PixelShaderElement {
         self.area.to_physical_precise_round(scale)
     }
 
-    fn opaque_regions(&self, scale: Scale<f64>) -> Vec<Rectangle<i32, Physical>> {
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         self.opaque_regions
             .iter()
             .map(|region| region.to_physical_precise_round(scale))
@@ -97,7 +97,7 @@ impl Element for PixelShaderElement {
     }
 
     fn alpha(&self) -> f32 {
-        1.0
+        self.alpha
     }
 
     fn kind(&self) -> Kind {
@@ -113,6 +113,7 @@ impl RenderElement<GlesRenderer> for PixelShaderElement {
         _src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), GlesError> {
         frame.render_pixel_shader_to(
             &self.shader,
@@ -123,7 +124,8 @@ impl RenderElement<GlesRenderer> for PixelShaderElement {
         )
     }
 
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage> {
+    #[inline]
+    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
         None
     }
 }

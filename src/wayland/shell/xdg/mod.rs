@@ -141,6 +141,7 @@ use wayland_server::{
 use super::PingError;
 
 pub mod decoration;
+pub mod dialog;
 
 // handlers for the xdg_shell protocol
 pub(super) mod handlers;
@@ -337,6 +338,12 @@ xdg_role!(
         /// should be brought to front. If the parent is focused
         /// all of it's child should be brought to front.
         pub parent: Option<wl_surface::WlSurface>,
+        /// Hints that the dialog has "modal" behavior.
+        /// Modal dialogs typically require to be fully addressed by the user (i.e. closed)
+        /// before resuming interaction with the parent toplevel, and may require a distinct presentation.
+        ///
+        /// This value has no effect on toplevels that are not attached to a parent toplevel.
+        pub modal: bool,
         /// Holds the optional title the client has set for
         /// this toplevel. For example a web-browser will most likely
         /// set this to include the current uri.
@@ -958,6 +965,7 @@ impl IntoIterator for ToplevelStateSet {
 }
 
 impl From<ToplevelStateSet> for Vec<xdg_toplevel::State> {
+    #[inline]
     fn from(states: ToplevelStateSet) -> Self {
         states.states
     }
@@ -1006,6 +1014,7 @@ impl<T> From<T> for WmCapabilitySet
 where
     T: IntoIterator<Item = xdg_toplevel::WmCapabilities>,
 {
+    #[inline]
     fn from(capabilities: T) -> Self {
         let capabilities = capabilities.into_iter().collect();
         Self { capabilities }
@@ -1276,6 +1285,7 @@ pub struct ShellClient {
 }
 
 impl std::cmp::PartialEq for ShellClient {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.kind == other.kind
     }
@@ -1289,6 +1299,7 @@ impl ShellClient {
     }
 
     /// Is the shell client represented by this handle still connected?
+    #[inline]
     pub fn alive(&self) -> bool {
         self.kind.alive()
     }
@@ -1354,6 +1365,7 @@ pub struct ToplevelSurface {
 }
 
 impl std::cmp::PartialEq for ToplevelSurface {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         // self.alive() && other.alive() &&
         self.wl_surface == other.wl_surface
@@ -1362,6 +1374,7 @@ impl std::cmp::PartialEq for ToplevelSurface {
 
 impl ToplevelSurface {
     /// Is the toplevel surface referred by this handle still alive?
+    #[inline]
     pub fn alive(&self) -> bool {
         self.wl_surface.alive() && self.shell_surface.alive()
     }
@@ -1573,6 +1586,7 @@ impl ToplevelSurface {
     }
 
     /// Access the underlying `wl_surface` of this toplevel surface
+    #[inline]
     pub fn wl_surface(&self) -> &wl_surface::WlSurface {
         &self.wl_surface
     }
@@ -1690,6 +1704,7 @@ pub struct PopupSurface {
 }
 
 impl std::cmp::PartialEq for PopupSurface {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         // self.alive() && other.alive() &&
         self.wl_surface == other.wl_surface
@@ -1698,6 +1713,7 @@ impl std::cmp::PartialEq for PopupSurface {
 
 impl PopupSurface {
     /// Is the toplevel surface referred by this handle still alive?
+    #[inline]
     pub fn alive(&self) -> bool {
         self.wl_surface.alive() && self.shell_surface.alive()
     }
@@ -1925,6 +1941,7 @@ impl PopupSurface {
     }
 
     /// Access the underlying `wl_surface` of this popup surface
+    #[inline]
     pub fn wl_surface(&self) -> &wl_surface::WlSurface {
         &self.wl_surface
     }
@@ -1993,12 +2010,14 @@ pub enum Configure {
 }
 
 impl From<ToplevelConfigure> for Configure {
+    #[inline]
     fn from(configure: ToplevelConfigure) -> Self {
         Configure::Toplevel(configure)
     }
 }
 
 impl From<PopupConfigure> for Configure {
+    #[inline]
     fn from(configure: PopupConfigure) -> Self {
         Configure::Popup(configure)
     }

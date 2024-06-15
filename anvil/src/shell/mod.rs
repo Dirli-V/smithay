@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
 #[cfg(feature = "xwayland")]
-use smithay::xwayland::{X11Wm, XWaylandClientData};
+use smithay::xwayland::XWaylandClientData;
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
     desktop::{
@@ -16,7 +16,7 @@ use smithay::{
             Client, Resource,
         },
     },
-    utils::{Logical, Point, Rectangle, Size},
+    utils::{IsAlive, Logical, Point, Rectangle, Size},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -62,7 +62,7 @@ fn fullscreen_output_geometry(
         .or_else(|| {
             let w = space
                 .elements()
-                .find(|window| window.wl_surface().map(|s| s == *wl_surface).unwrap_or(false));
+                .find(|window| window.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false));
             w.and_then(|w| space.outputs_for_element(w).first().cloned())
         })
         .as_ref()
@@ -78,7 +78,11 @@ impl FullscreenSurface {
     }
 
     pub fn get(&self) -> Option<WindowElement> {
-        self.0.borrow().clone()
+        let mut window = self.0.borrow_mut();
+        if window.as_ref().map(|w| !w.alive()).unwrap_or(false) {
+            *window = None;
+        }
+        window.clone()
     }
 
     pub fn clear(&self) -> Option<WindowElement> {
@@ -114,20 +118,21 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
                     .buffer
                     .as_ref()
                     .and_then(|assignment| match assignment {
-                        BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).ok(),
+                        BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).cloned().ok(),
                         _ => None,
                     })
             });
             if let Some(dmabuf) = maybe_dmabuf {
                 if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
-                    let client = surface.client().unwrap();
-                    let res = state.handle.insert_source(source, move |_, _, data| {
-                        let dh = data.display_handle.clone();
-                        data.client_compositor_state(&client).blocker_cleared(data, &dh);
-                        Ok(())
-                    });
-                    if res.is_ok() {
-                        add_blocker(surface, blocker);
+                    if let Some(client) = surface.client() {
+                        let res = state.handle.insert_source(source, move |_, _, data| {
+                            let dh = data.display_handle.clone();
+                            data.client_compositor_state(&client).blocker_cleared(data, &dh);
+                            Ok(())
+                        });
+                        if res.is_ok() {
+                            add_blocker(surface, blocker);
+                        }
                     }
                 }
             }
@@ -135,9 +140,6 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        #[cfg(feature = "xwayland")]
-        X11Wm::commit_hook::<AnvilState<BackendData>>(surface);
-
         on_commit_buffer_handler::<Self>(surface);
         self.backend_data.early_import(surface);
 
@@ -194,7 +196,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowElement> {
         self.space
             .elements()
-            .find(|window| window.wl_surface().map(|s| s == *surface).unwrap_or(false))
+            .find(|window| window.wl_surface().map(|s| &*s == surface).unwrap_or(false))
             .cloned()
     }
 }
@@ -220,7 +222,7 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
 
     if let Some(window) = space
         .elements()
-        .find(|window| window.wl_surface().map(|s| s == *surface).unwrap_or(false))
+        .find(|window| window.wl_surface().map(|s| &*s == surface).unwrap_or(false))
         .cloned()
     {
         // send the initial configure if relevant

@@ -49,6 +49,7 @@ pub enum DummyError {
 }
 
 impl From<DummyError> for SwapBuffersError {
+    #[inline]
     fn from(value: DummyError) -> Self {
         SwapBuffersError::TemporaryFailure(Box::new(value))
     }
@@ -225,6 +226,7 @@ impl Frame for DummyFrame {
         _src: Rectangle<f64, Buffer>,
         _dst: Rectangle<i32, Physical>,
         _damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
         _src_transform: Transform,
         _alpha: f32,
     ) -> Result<(), Self::Error> {

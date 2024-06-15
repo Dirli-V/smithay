@@ -250,7 +250,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             let window = self
                 .space
                 .elements()
-                .find(|element| element.wl_surface().as_ref() == Some(&surface));
+                .find(|element| element.wl_surface().as_deref() == Some(&surface));
             if let Some(window) = window {
                 use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
                 let is_ssd = configure
@@ -281,14 +281,17 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                     .as_ref()
                     .and_then(Output::from_resource)
                     .unwrap_or_else(|| self.space.outputs().next().unwrap().clone());
-                let client = self.display_handle.get_client(wl_surface.id()).unwrap();
+                let client = match self.display_handle.get_client(wl_surface.id()) {
+                    Ok(client) => client,
+                    Err(_) => return,
+                };
                 for output in output.client_outputs(&client) {
                     wl_output = Some(output);
                 }
                 let window = self
                     .space
                     .elements()
-                    .find(|window| window.wl_surface().map(|s| s == *wl_surface).unwrap_or(false))
+                    .find(|window| window.wl_surface().map(|s| &*s == wl_surface).unwrap_or(false))
                     .unwrap();
 
                 surface.with_pending_state(|state| {
@@ -389,7 +392,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         if let Some(root) = find_popup_root_surface(&kind).ok().and_then(|root| {
             self.space
                 .elements()
-                .find(|w| w.wl_surface().map(|s| s == root).unwrap_or(false))
+                .find(|w| w.wl_surface().map(|s| *s == root).unwrap_or(false))
                 .cloned()
                 .map(KeyboardFocusTarget::from)
                 .or_else(|| {
@@ -414,7 +417,7 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
                         return;
                     }
                     keyboard.set_focus(self, grab.current_grab(), serial);
-                    keyboard.set_grab(PopupKeyboardGrab::new(&grab), serial);
+                    keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
                 }
                 if let Some(pointer) = seat.get_pointer() {
                     if pointer.is_grabbed()
@@ -595,13 +598,13 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 fn handle_toplevel_commit(space: &mut Space<WindowElement>, surface: &WlSurface) -> Option<()> {
     let window = space
         .elements()
-        .find(|w| w.wl_surface().as_ref() == Some(surface))
+        .find(|w| w.wl_surface().as_deref() == Some(surface))
         .cloned()?;
 
     let mut window_loc = space.element_location(&window)?;
     let geometry = window.geometry();
 
-    let new_loc: Point<Option<i32>, Logical> = with_states(&window.wl_surface()?, |states| {
+    let new_loc: Point<Option<i32>, Logical> = with_states(window.wl_surface().as_deref()?, |states| {
         let data = states.data_map.get::<RefCell<SurfaceData>>()?.borrow_mut();
 
         if let ResizeState::Resizing(resize_data) = data.resize_state {

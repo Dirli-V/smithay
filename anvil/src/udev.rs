@@ -1,5 +1,3 @@
-#[cfg(feature = "xwayland")]
-use std::ffi::OsString;
 use std::{
     collections::{hash_map::HashMap, HashSet},
     io,
@@ -32,13 +30,13 @@ use smithay::{
             compositor::DrmCompositor, CreateDrmNodeError, DrmAccessError, DrmDevice, DrmDeviceFd, DrmError,
             DrmEvent, DrmEventMetadata, DrmNode, DrmSurface, GbmBufferedSurface, NodeType,
         },
-        egl::{self, context::ContextPriority, EGLDevice, EGLDisplay},
+        egl::{self, context::ContextPriority, EGLContext, EGLDevice, EGLDisplay},
         input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
             damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
             element::{memory::MemoryRenderBuffer, AsRenderElements, RenderElement, RenderElementStates},
-            gles::{GlesRenderer, GlesTexture},
+            gles::{Capability, GlesRenderer, GlesTexture},
             multigpu::{gbm::GbmGlesBackend, GpuManager, MultiRenderer},
             sync::SyncPoint,
             Bind, DebugFlags, ExportMem, ImportDma, ImportMemWl, Offscreen, Renderer,
@@ -243,7 +241,18 @@ pub fn run_udev() {
     };
     info!("Using {} as primary gpu.", primary_gpu);
 
-    let gpus = GpuManager::new(GbmGlesBackend::with_context_priority(ContextPriority::High)).unwrap();
+    let gpus = GpuManager::new(GbmGlesBackend::with_factory(|egl_display| {
+        let egl_context = EGLContext::new_with_priority(egl_display, ContextPriority::High)?;
+        let disable_color_transform = std::env::var("ANVIL_DISABLE_COLOR_TRANSFORM").is_ok();
+        unsafe {
+            let capabilities = GlesRenderer::supported_capabilities(&egl_context)?
+                .into_iter()
+                .filter(|c| !disable_color_transform || *c != Capability::ColorTransformations);
+
+            Ok(GlesRenderer::with_capabilities(egl_context, capabilities)?)
+        }
+    }))
+    .unwrap();
 
     let data = UdevData {
         dh: display_handle.clone(),
@@ -463,15 +472,7 @@ pub fn run_udev() {
      * Start XWayland if supported
      */
     #[cfg(feature = "xwayland")]
-    if let Err(e) = state.xwayland.start(
-        state.handle.clone(),
-        None,
-        std::iter::empty::<(OsString, OsString)>(),
-        true,
-        |_| {},
-    ) {
-        error!("Failed to start XWayland: {}", e);
-    }
+    state.start_xwayland();
 
     /*
      * And run our loop
@@ -1058,6 +1059,9 @@ impl AnvilState<UdevData> {
                     }
                 };
                 compositor.set_debug_flags(self.backend_data.debug_flags);
+
+                let disable_direct_scanout = std::env::var("ANVIL_DISABLE_DIRECT_SCANOUT").is_ok();
+                compositor.use_direct_scanout(!disable_direct_scanout);
                 SurfaceComposition::Compositor(compositor)
             };
 

@@ -6,7 +6,7 @@ use crate::{
     utils::{Logical, Point, Serial},
 };
 
-use super::{DownEvent, MotionEvent, TouchInnerHandle, UpEvent};
+use super::{DownEvent, MotionEvent, OrientationEvent, ShapeEvent, TouchInnerHandle, UpEvent};
 
 /// A trait to implement a touch grab
 ///
@@ -91,8 +91,23 @@ pub trait TouchGrab<D: SeatHandler>: Send {
     /// Usually called in case the compositor decides the touch stream is a global gesture.
     fn cancel(&mut self, data: &mut D, handle: &mut TouchInnerHandle<'_, D>, seq: Serial);
 
+    /// A touch point has changed its shape.
+    fn shape(&mut self, data: &mut D, handle: &mut TouchInnerHandle<'_, D>, event: &ShapeEvent, seq: Serial);
+
+    /// A touch point has changed its orientation.
+    fn orientation(
+        &mut self,
+        data: &mut D,
+        handle: &mut TouchInnerHandle<'_, D>,
+        event: &OrientationEvent,
+        seq: Serial,
+    );
+
     /// The data about the event that started the grab.
     fn start_data(&self) -> &GrabStartData<D>;
+
+    /// The grab has been unset or replaced with another grab.
+    fn unset(&mut self, data: &mut D);
 }
 
 /// Data about the event that started the grab.
@@ -127,23 +142,6 @@ impl<D: SeatHandler + 'static> Clone for GrabStartData<D> {
     }
 }
 
-pub(super) enum GrabStatus<D> {
-    None,
-    Active(Serial, Box<dyn TouchGrab<D>>),
-    Borrowed,
-}
-
-// TouchGrab is a trait, so we have to impl Debug manually
-impl<D> fmt::Debug for GrabStatus<D> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            GrabStatus::None => f.debug_tuple("GrabStatus::None").finish(),
-            GrabStatus::Active(serial, _) => f.debug_tuple("GrabStatus::Active").field(&serial).finish(),
-            GrabStatus::Borrowed => f.debug_tuple("GrabStatus::Borrowed").finish(),
-        }
-    }
-}
-
 /// The default grab, the behavior when no particular grab is in progress
 #[derive(Debug)]
 pub struct DefaultGrab;
@@ -159,6 +157,7 @@ impl<D: SeatHandler + 'static> TouchGrab<D> for DefaultGrab {
     ) {
         handle.down(data, focus.clone(), event, seq);
         handle.set_grab(
+            self,
             data,
             event.serial,
             TouchDownGrab {
@@ -195,9 +194,25 @@ impl<D: SeatHandler + 'static> TouchGrab<D> for DefaultGrab {
         handle.cancel(data, seq)
     }
 
+    fn shape(&mut self, data: &mut D, handle: &mut TouchInnerHandle<'_, D>, event: &ShapeEvent, seq: Serial) {
+        handle.shape(data, event, seq)
+    }
+
+    fn orientation(
+        &mut self,
+        data: &mut D,
+        handle: &mut TouchInnerHandle<'_, D>,
+        event: &OrientationEvent,
+        seq: Serial,
+    ) {
+        handle.orientation(data, event, seq)
+    }
+
     fn start_data(&self) -> &GrabStartData<D> {
         unreachable!()
     }
+
+    fn unset(&mut self, _data: &mut D) {}
 }
 
 /// A touch down grab, basic grab started when an user touches a surface
@@ -238,7 +253,7 @@ impl<D: SeatHandler + 'static> TouchGrab<D> for TouchDownGrab<D> {
         handle.up(data, event, seq);
         self.touch_points = self.touch_points.saturating_sub(1);
         if self.touch_points == 0 {
-            handle.unset_grab(data);
+            handle.unset_grab(self, data);
         }
     }
 
@@ -259,10 +274,26 @@ impl<D: SeatHandler + 'static> TouchGrab<D> for TouchDownGrab<D> {
 
     fn cancel(&mut self, data: &mut D, handle: &mut TouchInnerHandle<'_, D>, seq: Serial) {
         handle.cancel(data, seq);
-        handle.unset_grab(data);
+        handle.unset_grab(self, data);
+    }
+
+    fn shape(&mut self, data: &mut D, handle: &mut TouchInnerHandle<'_, D>, event: &ShapeEvent, seq: Serial) {
+        handle.shape(data, event, seq)
+    }
+
+    fn orientation(
+        &mut self,
+        data: &mut D,
+        handle: &mut TouchInnerHandle<'_, D>,
+        event: &OrientationEvent,
+        seq: Serial,
+    ) {
+        handle.orientation(data, event, seq)
     }
 
     fn start_data(&self) -> &GrabStartData<D> {
         &self.start_data
     }
+
+    fn unset(&mut self, _data: &mut D) {}
 }

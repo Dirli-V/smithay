@@ -32,7 +32,7 @@ use crate::{
 #[cfg(feature = "wayland_frontend")]
 use super::utils::Buffer;
 use super::{
-    utils::{CommitCounter, DamageSet},
+    utils::{CommitCounter, DamageSet, OpaqueRegions},
     Renderer,
 };
 
@@ -92,6 +92,7 @@ impl Id {
 
 #[cfg(feature = "wayland_frontend")]
 impl<R: Resource> From<&R> for Id {
+    #[inline]
     fn from(resource: &R) -> Self {
         Id::from_wayland_resource(resource)
     }
@@ -99,12 +100,12 @@ impl<R: Resource> From<&R> for Id {
 
 /// The underlying storage for a element
 #[derive(Debug, Clone)]
-pub enum UnderlyingStorage {
+pub enum UnderlyingStorage<'a> {
     /// A wayland buffer
     #[cfg(feature = "wayland_frontend")]
-    Wayland(Buffer),
+    Wayland(&'a Buffer),
     /// A memory backed buffer
-    Memory(memory::MemoryBuffer),
+    Memory(&'a memory::MemoryBuffer),
 }
 
 /// Defines the (optional) reason why a [`Element`] was selected for
@@ -192,7 +193,7 @@ impl PrimaryScanoutOutput {
 
         let has_valid_output = primary_scanout_output
             .as_ref()
-            .map(|(current, _)| current.upgrade().is_some())
+            .map(|(current, _)| current.is_alive())
             .unwrap_or(false);
         let same_output = primary_scanout_output
             .as_ref()
@@ -365,8 +366,8 @@ pub trait Element {
         }
     }
     /// Get the opaque regions of the element relative to the element
-    fn opaque_regions(&self, _scale: Scale<f64>) -> Vec<Rectangle<i32, Physical>> {
-        vec![]
+    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        OpaqueRegions::default()
     }
     /// Returns an alpha value the element should be drawn with regardless of any
     /// already encoded alpha in it's underlying representation.
@@ -388,10 +389,12 @@ pub trait RenderElement<R: Renderer>: Element {
         src: Rectangle<f64, BufferCoords>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), R::Error>;
 
     /// Get the underlying storage of this element, may be used to optimize rendering (eg. drm planes)
-    fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage> {
+    #[inline]
+    fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         let _ = renderer;
         None
     }
@@ -446,7 +449,7 @@ where
         (*self).damage_since(scale, commit)
     }
 
-    fn opaque_regions(&self, scale: Scale<f64>) -> Vec<Rectangle<i32, Physical>> {
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         (*self).opaque_regions(scale)
     }
 
@@ -464,7 +467,8 @@ where
     R: Renderer,
     E: RenderElement<R> + Element,
 {
-    fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage> {
+    #[inline]
+    fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         (*self).underlying_storage(renderer)
     }
 
@@ -474,8 +478,9 @@ where
         src: Rectangle<f64, BufferCoords>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), R::Error> {
-        (*self).draw(frame, src, dst, damage)
+        (*self).draw(frame, src, dst, damage, opaque_regions)
     }
 }
 
@@ -711,7 +716,7 @@ macro_rules! render_elements_internal {
             }
         }
 
-        fn opaque_regions(&self, scale: $crate::utils::Scale<f64>) -> Vec<$crate::utils::Rectangle<i32, $crate::utils::Physical>> {
+        fn opaque_regions(&self, scale: $crate::utils::Scale<f64>) -> $crate::backend::renderer::utils::OpaqueRegions<i32, $crate::utils::Physical> {
             match self {
                 $(
                     #[allow(unused_doc_comments)]
@@ -757,6 +762,7 @@ macro_rules! render_elements_internal {
             src: $crate::utils::Rectangle<f64, $crate::utils::Buffer>,
             dst: $crate::utils::Rectangle<i32, $crate::utils::Physical>,
             damage: &[$crate::utils::Rectangle<i32, $crate::utils::Physical>],
+            opaque_regions: &[$crate::utils::Rectangle<i32, $crate::utils::Physical>],
         ) -> Result<(), <$renderer as $crate::backend::renderer::Renderer>::Error>
         where
         $(
@@ -773,13 +779,14 @@ macro_rules! render_elements_internal {
                     $(
                         #[$meta]
                     )*
-                    Self::$body(x) => $crate::render_elements_internal!(@call $renderer $(as $other_renderer)?; draw; x, frame, src, dst, damage)
+                    Self::$body(x) => $crate::render_elements_internal!(@call $renderer $(as $other_renderer)?; draw; x, frame, src, dst, damage, opaque_regions)
                 ),*,
                 Self::_GenericCatcher(_) => unreachable!(),
             }
         }
 
-        fn underlying_storage(&self, renderer: &mut $renderer) -> Option<$crate::backend::renderer::element::UnderlyingStorage>
+        #[inline]
+        fn underlying_storage(&self, renderer: &mut $renderer) -> Option<$crate::backend::renderer::element::UnderlyingStorage<'_>>
         {
             match self {
                 $(
@@ -800,6 +807,7 @@ macro_rules! render_elements_internal {
             src: $crate::utils::Rectangle<f64, $crate::utils::Buffer>,
             dst: $crate::utils::Rectangle<i32, $crate::utils::Physical>,
             damage: &[$crate::utils::Rectangle<i32, $crate::utils::Physical>],
+            opaque_regions: &[$crate::utils::Rectangle<i32, $crate::utils::Physical>],
         ) -> Result<(), <$renderer as $crate::backend::renderer::Renderer>::Error>
         {
             match self {
@@ -808,13 +816,14 @@ macro_rules! render_elements_internal {
                     $(
                         #[$meta]
                     )*
-                    Self::$body(x) => $crate::render_elements_internal!(@call $renderer $(as $other_renderer)?; draw; x, frame, src, dst, damage)
+                    Self::$body(x) => $crate::render_elements_internal!(@call $renderer $(as $other_renderer)?; draw; x, frame, src, dst, damage, opaque_regions)
                 ),*,
                 Self::_GenericCatcher(_) => unreachable!(),
             }
         }
 
-        fn underlying_storage(&self, renderer: &mut $renderer) -> Option<$crate::backend::renderer::element::UnderlyingStorage>
+        #[inline]
+        fn underlying_storage(&self, renderer: &mut $renderer) -> Option<$crate::backend::renderer::element::UnderlyingStorage<'_>>
         {
             match self {
                 $(
@@ -1004,6 +1013,7 @@ macro_rules! render_elements_internal {
                     $($renderer: std::convert::AsMut<$other_renderer>,)?
                 )*
             {
+                #[inline]
                 fn from(field: $field) -> $name<$renderer> {
                     $name::$body(field)
                 }
@@ -1023,6 +1033,7 @@ macro_rules! render_elements_internal {
                     $($renderer: std::convert::AsMut<$other_renderer>,)?
                 )*
             {
+                #[inline]
                 fn from(field: $field) -> $name<$renderer, $custom> {
                     $name::$body(field)
                 }
@@ -1041,6 +1052,7 @@ macro_rules! render_elements_internal {
                     $($renderer: std::convert::AsMut<$other_renderer>,)?
                 )*
             {
+                #[inline]
                 fn from(field: $field) -> $name<$lt, $renderer> {
                     $name::$body(field)
                 }
@@ -1060,6 +1072,7 @@ macro_rules! render_elements_internal {
                     $($renderer: std::convert::AsMut<$other_renderer>,)?
                 )*
             {
+                #[inline]
                 fn from(field: $field) -> $name<$lt, $renderer, $custom> {
                     $name::$body(field)
                 }
@@ -1072,6 +1085,7 @@ macro_rules! render_elements_internal {
                 #[$meta]
             )*
             impl From<$field> for $name {
+                #[inline]
                 fn from(field: $field) -> $name {
                     $name::$body(field)
                 }
@@ -1084,6 +1098,7 @@ macro_rules! render_elements_internal {
                 #[$meta]
             )*
             impl<$lt> From<$field> for $name<$lt> {
+                #[inline]
                 fn from(field: $field) -> $name<$lt> {
                     $name::$body(field)
                 }
@@ -1135,6 +1150,7 @@ macro_rules! render_elements_internal {
 /// #         _src: Rectangle<f64, Buffer>,
 /// #         _dst: Rectangle<i32, Physical>,
 /// #         _damage: &[Rectangle<i32, Physical>],
+/// #         _opaque_regions: &[Rectangle<i32, Physical>],
 /// #     ) -> Result<(), <R as Renderer>::Error> {
 /// #         unimplemented!()
 /// #     }
@@ -1165,6 +1181,7 @@ macro_rules! render_elements_internal {
 /// #         _src: Rectangle<f64, Buffer>,
 /// #         _dst: Rectangle<i32, Physical>,
 /// #         _damage: &[Rectangle<i32, Physical>],
+/// #         _opaque_regions: &[Rectangle<i32, Physical>],
 /// #     ) -> Result<(), <R as Renderer>::Error> {
 /// #         unimplemented!()
 /// #     }
@@ -1277,6 +1294,7 @@ macro_rules! render_elements_internal {
 /// #         _: &Self::TextureId,
 /// #         _: Rectangle<f64, Buffer>,
 /// #         _: Rectangle<i32, Physical>,
+/// #         _: &[Rectangle<i32, Physical>],
 /// #         _: &[Rectangle<i32, Physical>],
 /// #         _: Transform,
 /// #         _: f32,
@@ -1437,7 +1455,7 @@ where
         self.0.damage_since(scale, commit)
     }
 
-    fn opaque_regions(&self, scale: Scale<f64>) -> Vec<Rectangle<i32, Physical>> {
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         self.0.opaque_regions(scale)
     }
 
@@ -1461,11 +1479,13 @@ where
         src: Rectangle<f64, BufferCoords>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), <R as Renderer>::Error> {
-        self.0.draw(frame, src, dst, damage)
+        self.0.draw(frame, src, dst, damage, opaque_regions)
     }
 
-    fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage> {
+    #[inline]
+    fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         self.0.underlying_storage(renderer)
     }
 }

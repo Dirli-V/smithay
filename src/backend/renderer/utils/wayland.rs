@@ -53,6 +53,7 @@ pub struct RendererSurfaceState {
 struct InnerBuffer(WlBuffer);
 
 impl Drop for InnerBuffer {
+    #[inline]
     fn drop(&mut self) {
         self.0.release();
     }
@@ -65,6 +66,7 @@ pub struct Buffer {
 }
 
 impl From<WlBuffer> for Buffer {
+    #[inline]
     fn from(buffer: WlBuffer) -> Self {
         Buffer {
             inner: Arc::new(InnerBuffer(buffer)),
@@ -75,18 +77,21 @@ impl From<WlBuffer> for Buffer {
 impl std::ops::Deref for Buffer {
     type Target = WlBuffer;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.inner.0
     }
 }
 
 impl PartialEq<WlBuffer> for Buffer {
+    #[inline]
     fn eq(&self, other: &WlBuffer) -> bool {
         self.inner.0 == *other
     }
 }
 
 impl PartialEq<WlBuffer> for &Buffer {
+    #[inline]
     fn eq(&self, other: &WlBuffer) -> bool {
         self.inner.0 == *other
     }
@@ -237,6 +242,16 @@ impl RendererSurfaceState {
         self.buffer_dimensions
             .as_ref()
             .map(|dim| dim.to_logical(self.buffer_scale, self.buffer_transform))
+    }
+
+    /// Returns the scale of the current attached buffer
+    pub fn buffer_scale(&self) -> i32 {
+        self.buffer_scale
+    }
+
+    /// Returns the transform of the current attached buffer
+    pub fn buffer_transform(&self) -> Transform {
+        self.buffer_transform
     }
 
     /// Returns the logical size of the surface.
@@ -466,7 +481,7 @@ where
 
 /// Imports buffers of a surface and its subsurfaces using a given [`Renderer`].
 ///
-/// This (or `import_surface`) need to be called before`draw_render_elements`, if used later.
+/// This (or `import_surface`) need to be called before `draw_render_elements`, if used later.
 ///
 /// Note: This will do nothing, if you are not using
 /// [`crate::backend::renderer::utils::on_commit_buffer_handler`]
@@ -610,7 +625,7 @@ where
             continue;
         }
 
-        element.draw(frame, element.src(), element_geometry, &element_damage)?;
+        element.draw(frame, element.src(), element_geometry, &element_damage, &[])?;
     }
 
     Ok(Some(render_damage))

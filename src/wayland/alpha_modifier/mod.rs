@@ -1,4 +1,7 @@
-//! Implementation of wp_content_type protocol
+//! Implementation of `wp_alpha_modifier` protocol
+//!
+//! [`WaylandSurfaceRenderElement`][`crate::backend::renderer::element::surface::WaylandSurfaceRenderElement`]
+//! takes the alpha multiplier into account automatically.
 //!
 //! ### Example
 //!
@@ -7,9 +10,9 @@
 //! #
 //! use wayland_server::{protocol::wl_surface::WlSurface, DisplayHandle};
 //! use smithay::{
-//!     delegate_content_type, delegate_compositor,
+//!     delegate_alpha_modifier, delegate_compositor,
 //!     wayland::compositor::{self, CompositorState, CompositorClientState, CompositorHandler},
-//!     wayland::content_type::{ContentTypeSurfaceCachedState, ContentTypeState},
+//!     wayland::alpha_modifier::{AlphaModifierSurfaceCachedState, AlphaModifierState},
 //! };
 //!
 //! pub struct State {
@@ -18,7 +21,7 @@
 //! struct ClientState { compositor_state: CompositorClientState }
 //! impl wayland_server::backend::ClientData for ClientState {}
 //!
-//! delegate_content_type!(State);
+//! delegate_alpha_modifier!(State);
 //! delegate_compositor!(State);
 //!
 //! impl CompositorHandler for State {
@@ -32,8 +35,8 @@
 //!
 //!    fn commit(&mut self, surface: &WlSurface) {
 //!        compositor::with_states(&surface, |states| {
-//!            let current = states.cached_state.current::<ContentTypeSurfaceCachedState>();
-//!            dbg!(current.content_type());
+//!            let current = states.cached_state.current::<AlphaModifierSurfaceCachedState>();
+//!            dbg!(current.multiplier());
 //!        });
 //!    }
 //! }
@@ -41,7 +44,7 @@
 //! let mut display = wayland_server::Display::<State>::new().unwrap();
 //!
 //! let compositor_state = CompositorState::new::<State>(&display.handle());
-//! ContentTypeState::new::<State>(&display.handle());
+//! AlphaModifierState::new::<State>(&display.handle());
 //!
 //! let state = State {
 //!     compositor_state,
@@ -53,9 +56,8 @@ use std::sync::{
     Mutex,
 };
 
-use wayland_protocols::wp::content_type::v1::server::{
-    wp_content_type_manager_v1::WpContentTypeManagerV1,
-    wp_content_type_v1::{self, WpContentTypeV1},
+use wayland_protocols::wp::alpha_modifier::v1::server::{
+    wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1, wp_alpha_modifier_v1::WpAlphaModifierV1,
 };
 use wayland_server::{
     backend::GlobalId, protocol::wl_surface::WlSurface, Dispatch, DisplayHandle, GlobalDispatch, Resource,
@@ -71,35 +73,39 @@ mod dispatch;
 ///
 /// ```no_run
 /// use smithay::wayland::compositor;
-/// use smithay::wayland::content_type::ContentTypeSurfaceCachedState;
+/// use smithay::wayland::alpha_modifier::AlphaModifierSurfaceCachedState;
 ///
 /// # let wl_surface = todo!();
 /// compositor::with_states(&wl_surface, |states| {
-///     let current = states.cached_state.current::<ContentTypeSurfaceCachedState>();
-///     dbg!(current.content_type());
+///     let current = states.cached_state.current::<AlphaModifierSurfaceCachedState>();
+///     dbg!(current.multiplier());
 /// });
 /// ```
-#[derive(Debug, Clone, Copy)]
-pub struct ContentTypeSurfaceCachedState {
-    content_type: wp_content_type_v1::Type,
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AlphaModifierSurfaceCachedState {
+    multiplier: Option<u32>,
 }
 
-impl ContentTypeSurfaceCachedState {
-    /// This informs the compositor that the client believes it is displaying buffers matching this content type.
-    pub fn content_type(&self) -> &wp_content_type_v1::Type {
-        &self.content_type
+impl AlphaModifierSurfaceCachedState {
+    /// Alpha multiplier for the surface
+    pub fn multiplier(&self) -> Option<u32> {
+        self.multiplier
+    }
+
+    /// Alpha multiplier for the surface
+    pub fn multiplier_f32(&self) -> Option<f32> {
+        self.multiplier
+            .map(|multiplier| multiplier as f32 / u32::MAX as f32)
+    }
+
+    /// Alpha multiplier for the surface
+    pub fn multiplier_f64(&self) -> Option<f64> {
+        self.multiplier
+            .map(|multiplier| multiplier as f64 / u32::MAX as f64)
     }
 }
 
-impl Default for ContentTypeSurfaceCachedState {
-    fn default() -> Self {
-        Self {
-            content_type: wp_content_type_v1::Type::None,
-        }
-    }
-}
-
-impl Cacheable for ContentTypeSurfaceCachedState {
+impl Cacheable for AlphaModifierSurfaceCachedState {
     fn commit(&mut self, _dh: &DisplayHandle) -> Self {
         *self
     }
@@ -110,11 +116,11 @@ impl Cacheable for ContentTypeSurfaceCachedState {
 }
 
 #[derive(Debug)]
-struct ContentTypeSurfaceData {
+struct AlphaModifierSurfaceData {
     is_resource_attached: AtomicBool,
 }
 
-impl ContentTypeSurfaceData {
+impl AlphaModifierSurfaceData {
     fn new() -> Self {
         Self {
             is_resource_attached: AtomicBool::new(false),
@@ -131,72 +137,71 @@ impl ContentTypeSurfaceData {
     }
 }
 
-/// User data of `WpContentTypeV1` object
+/// User data of [WpAlphaModifierSurfaceV1] object
 #[derive(Debug)]
-pub struct ContentTypeUserData(Mutex<Weak<WlSurface>>);
+pub struct AlphaModifierSurfaceUserData(Mutex<Weak<WlSurface>>);
 
-impl ContentTypeUserData {
+impl AlphaModifierSurfaceUserData {
     fn new(surface: WlSurface) -> Self {
         Self(Mutex::new(surface.downgrade()))
     }
 
-    #[inline]
     fn wl_surface(&self) -> Option<WlSurface> {
         self.0.lock().unwrap().upgrade().ok()
     }
 }
 
-/// Delegate type for [WpContentTypeManagerV1] global.
+/// Delegate type for [WpAlphaModifierV1] global.
 #[derive(Debug)]
-pub struct ContentTypeState {
+pub struct AlphaModifierState {
     global: GlobalId,
 }
 
-impl ContentTypeState {
-    /// Regiseter new [WpContentTypeManagerV1] global
-    pub fn new<D>(display: &DisplayHandle) -> ContentTypeState
+impl AlphaModifierState {
+    /// Regiseter new [WpAlphaModifierV1] global
+    pub fn new<D>(display: &DisplayHandle) -> AlphaModifierState
     where
-        D: GlobalDispatch<WpContentTypeManagerV1, ()>
-            + Dispatch<WpContentTypeManagerV1, ()>
-            + Dispatch<WpContentTypeV1, ContentTypeUserData>
+        D: GlobalDispatch<WpAlphaModifierV1, ()>
+            + Dispatch<WpAlphaModifierV1, ()>
+            + Dispatch<WpAlphaModifierSurfaceV1, AlphaModifierSurfaceUserData>
             + 'static,
     {
-        let global = display.create_global::<D, WpContentTypeManagerV1, _>(1, ());
+        let global = display.create_global::<D, WpAlphaModifierV1, _>(1, ());
 
-        ContentTypeState { global }
+        AlphaModifierState { global }
     }
 
-    /// Returns the WpContentTypeManagerV1 global id
+    /// Returns the [WpAlphaModifierV1] global id
     pub fn global(&self) -> GlobalId {
         self.global.clone()
     }
 }
 
-/// Macro to delegate implementation of the wp content type protocol
+/// Macro to delegate implementation of the alpha modifier protocol
 #[macro_export]
-macro_rules! delegate_content_type {
+macro_rules! delegate_alpha_modifier {
     ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        type __WpContentTypeManagerV1 =
-            $crate::reexports::wayland_protocols::wp::content_type::v1::server::wp_content_type_manager_v1::WpContentTypeManagerV1;
-        type __WpContentTypeV1 =
-            $crate::reexports::wayland_protocols::wp::content_type::v1::server::wp_content_type_v1::WpContentTypeV1;
+        type __WpAlphaModifierV1 =
+            $crate::reexports::wayland_protocols::wp::alpha_modifier::v1::server::wp_alpha_modifier_v1::WpAlphaModifierV1;
+        type __WpAlphaModifierSurfaceV1 =
+            $crate::reexports::wayland_protocols::wp::alpha_modifier::v1::server::wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1;
 
         $crate::reexports::wayland_server::delegate_global_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
             [
-                __WpContentTypeManagerV1: ()
-            ] => $crate::wayland::content_type::ContentTypeState
+                __WpAlphaModifierV1: ()
+            ] => $crate::wayland::alpha_modifier::AlphaModifierState
         );
 
         $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
             [
-                __WpContentTypeManagerV1: ()
-            ] => $crate::wayland::content_type::ContentTypeState
+                __WpAlphaModifierV1: ()
+            ] => $crate::wayland::alpha_modifier::AlphaModifierState
         );
 
         $crate::reexports::wayland_server::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty:
             [
-                __WpContentTypeV1: $crate::wayland::content_type::ContentTypeUserData
-            ] => $crate::wayland::content_type::ContentTypeState
+                __WpAlphaModifierSurfaceV1: $crate::wayland::alpha_modifier::AlphaModifierSurfaceUserData
+            ] => $crate::wayland::alpha_modifier::AlphaModifierState
         );
     };
 }

@@ -66,7 +66,7 @@ impl<R: Renderer> std::fmt::Debug for PointerRenderElement<R> {
     }
 }
 
-impl<T: Texture + 'static, R> AsRenderElements<R> for PointerElement
+impl<T: Texture + Clone + 'static, R> AsRenderElements<R> for PointerElement
 where
     R: Renderer<TextureId = T> + ImportAll + ImportMem,
 {
@@ -202,6 +202,7 @@ where
         _src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), R::Error> {
         // FIXME: respect the src for cropping
         let scale = dst.size.to_f64() / self.src().size;
@@ -243,6 +244,7 @@ where
                 texture_src.to_f64(),
                 dst,
                 &damage,
+                &[],
                 Transform::Normal,
                 1.0,
             )?;

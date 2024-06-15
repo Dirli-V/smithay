@@ -51,6 +51,7 @@
 //! #         _: Rectangle<f64, Buffer>,
 //! #         _: Rectangle<i32, Physical>,
 //! #         _: &[Rectangle<i32, Physical>],
+//! #         _: &[Rectangle<i32, Physical>],
 //! #         _: Transform,
 //! #         _: f32,
 //! #     ) -> Result<(), Self::Error> {
@@ -148,7 +149,10 @@
 //! }
 //! ```
 use crate::{
-    backend::renderer::{utils::CommitCounter, Frame, Renderer},
+    backend::renderer::{
+        utils::{CommitCounter, OpaqueRegions},
+        Frame, Renderer,
+    },
     utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
 };
 
@@ -217,6 +221,11 @@ impl SolidColorBuffer {
             self.commit.increment();
         }
     }
+
+    /// Get the current color of this buffer
+    pub fn color(&self) -> [f32; 4] {
+        self.color
+    }
 }
 
 /// [`Element`] to render a solid color
@@ -277,6 +286,11 @@ impl SolidColorRenderElement {
             kind,
         }
     }
+
+    /// Get the current color of this element
+    pub fn color(&self) -> [f32; 4] {
+        self.color
+    }
 }
 
 impl Element for SolidColorRenderElement {
@@ -296,8 +310,8 @@ impl Element for SolidColorRenderElement {
         self.geometry
     }
 
-    fn opaque_regions(&self, _scale: Scale<f64>) -> Vec<Rectangle<i32, Physical>> {
-        self.opaque_regions.clone()
+    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        OpaqueRegions::from_slice(&self.opaque_regions)
     }
 
     fn alpha(&self) -> f32 {
@@ -317,11 +331,13 @@ impl<R: Renderer> RenderElement<R> for SolidColorRenderElement {
         _src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), <R as Renderer>::Error> {
         frame.draw_solid(dst, damage, self.color)
     }
 
-    fn underlying_storage(&self, _renderer: &mut R) -> Option<super::UnderlyingStorage> {
+    #[inline]
+    fn underlying_storage(&self, _renderer: &mut R) -> Option<super::UnderlyingStorage<'_>> {
         None
     }
 }

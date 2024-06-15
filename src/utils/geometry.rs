@@ -279,12 +279,14 @@ impl<N: Coordinate> Scale<N> {
 }
 
 impl<N: Coordinate> From<N> for Scale<N> {
+    #[inline]
     fn from(scale: N) -> Self {
         Scale { x: scale, y: scale }
     }
 }
 
 impl<N: Coordinate> From<(N, N)> for Scale<N> {
+    #[inline]
     fn from((scale_x, scale_y): (N, N)) -> Self {
         Scale {
             x: scale_x,
@@ -300,6 +302,7 @@ where
 {
     type Output = Scale<N>;
 
+    #[inline]
     fn mul(self, rhs: T) -> Self::Output {
         let rhs = rhs.into();
         Scale {
@@ -382,14 +385,14 @@ impl<N: Coordinate, Kind> Point<N, Kind> {
     /// Constrain this [`Point`] within a [`Rectangle`] with the same coordinates
     ///
     /// The [`Point`] returned is guaranteed to be not smaller than the [`Rectangle`]
-    /// location and not greater than the [`Rectangle`] size.
+    /// location and not greater than the [`Rectangle`] location plus size.
     #[inline]
     pub fn constrain(self, rect: impl Into<Rectangle<N, Kind>>) -> Point<N, Kind> {
         let rect = rect.into();
 
         Point {
-            x: self.x.max(rect.loc.x).min(rect.size.w),
-            y: self.y.max(rect.loc.y).min(rect.size.h),
+            x: self.x.max(rect.loc.x).min(rect.loc.x + rect.size.w),
+            y: self.y.max(rect.loc.y).min(rect.loc.y + rect.size.h),
             _kind: std::marker::PhantomData,
         }
     }
@@ -613,6 +616,7 @@ impl<N: Clone, Kind> Clone for Point<N, Kind> {
 impl<N: Copy, Kind> Copy for Point<N, Kind> {}
 
 impl<N: PartialEq, Kind> PartialEq for Point<N, Kind> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.x == other.x && self.y == other.y
     }
@@ -621,6 +625,7 @@ impl<N: PartialEq, Kind> PartialEq for Point<N, Kind> {
 impl<N: Eq, Kind> Eq for Point<N, Kind> {}
 
 impl<N: Default, Kind> Default for Point<N, Kind> {
+    #[inline]
     fn default() -> Self {
         Point {
             x: N::default(),
@@ -926,6 +931,7 @@ impl<N: Clone, Kind> Clone for Size<N, Kind> {
 impl<N: Copy, Kind> Copy for Size<N, Kind> {}
 
 impl<N: PartialEq, Kind> PartialEq for Size<N, Kind> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.w == other.w && self.h == other.h
     }
@@ -934,6 +940,7 @@ impl<N: PartialEq, Kind> PartialEq for Size<N, Kind> {
 impl<N: Eq, Kind> Eq for Size<N, Kind> {}
 
 impl<N: Default, Kind> Default for Size<N, Kind> {
+    #[inline]
     fn default() -> Self {
         Size {
             w: N::default(),
@@ -1192,14 +1199,20 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
             let mut checked = 0usize;
             let mut index = 0usize;
 
+            // If there is nothing left we can stop,
+            // we won't be able to subtract any further
+            if items == 0 {
+                return rects;
+            }
+
             while checked != items {
                 checked += 1;
 
                 // If there is no overlap there is nothing to subtract
-                if !rects[index].overlaps(other) {
+                let Some(intersection) = rects[index].intersection(other) else {
                     index += 1;
                     continue;
-                }
+                };
 
                 // We now know that we have to subtract the other rect
                 let item = rects.remove(index);
@@ -1208,9 +1221,6 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
                 if other.contains_rect(item) {
                     continue;
                 }
-
-                // we already checked that there is an overlap so the unwrap should be safe
-                let intersection = item.intersection(other).unwrap();
 
                 let top_rect = Rectangle::from_loc_and_size(
                     item.loc,
@@ -1395,6 +1405,7 @@ impl<N: Clone, Kind> Clone for Rectangle<N, Kind> {
 impl<N: Copy, Kind> Copy for Rectangle<N, Kind> {}
 
 impl<N: PartialEq, Kind> PartialEq for Rectangle<N, Kind> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.loc == other.loc && self.size == other.size
     }
@@ -1403,6 +1414,7 @@ impl<N: PartialEq, Kind> PartialEq for Rectangle<N, Kind> {
 impl<N: Eq, Kind> Eq for Rectangle<N, Kind> {}
 
 impl<N: Default, Kind> Default for Rectangle<N, Kind> {
+    #[inline]
     fn default() -> Self {
         Rectangle {
             loc: Default::default(),
@@ -1438,6 +1450,7 @@ impl Transform {
     /// Inverts any 90-degree transformation into 270-degree transformations and vise versa.
     ///
     /// Flipping is preserved and 180/Normal transformation are uneffected.
+    #[inline]
     pub fn invert(&self) -> Transform {
         match self {
             Transform::Normal => Transform::Normal,
@@ -1521,6 +1534,7 @@ impl Transform {
     }
 
     /// Returns the angle (in degrees) of the transformation
+    #[inline]
     pub fn degrees(&self) -> u32 {
         match self {
             Transform::Normal | Transform::Flipped => 0,
@@ -1534,6 +1548,7 @@ impl Transform {
 impl std::ops::Add for Transform {
     type Output = Self;
 
+    #[inline]
     fn add(self, other: Self) -> Self {
         let flipped = matches!((self.flipped(), other.flipped()), (true, false) | (false, true));
         let degrees = (self.degrees() + other.degrees()) % 360;
@@ -1553,6 +1568,7 @@ impl std::ops::Add for Transform {
 
 #[cfg(feature = "wayland_frontend")]
 impl From<Transform> for WlTransform {
+    #[inline]
     fn from(transform: Transform) -> Self {
         match transform {
             Transform::Normal => WlTransform::Normal,

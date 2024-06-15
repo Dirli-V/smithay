@@ -68,6 +68,7 @@ unsafe impl Send for WeakEGLDisplayHandle {}
 unsafe impl Sync for WeakEGLDisplayHandle {}
 
 impl From<Arc<EGLDisplayHandle>> for WeakEGLDisplayHandle {
+    #[inline]
     fn from(other: Arc<EGLDisplayHandle>) -> Self {
         WeakEGLDisplayHandle {
             handle: Arc::downgrade(&other),
@@ -77,12 +78,14 @@ impl From<Arc<EGLDisplayHandle>> for WeakEGLDisplayHandle {
 }
 
 impl Hash for WeakEGLDisplayHandle {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.ptr.hash(state);
     }
 }
 
 impl PartialEq for WeakEGLDisplayHandle {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.ptr == other.ptr
     }
@@ -93,12 +96,14 @@ impl Eq for WeakEGLDisplayHandle {}
 impl Deref for EGLDisplayHandle {
     type Target = ffi::egl::types::EGLDisplay;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.handle
     }
 }
 
 impl Drop for EGLDisplayHandle {
+    #[inline]
     fn drop(&mut self) {
         if self.should_terminate {
             unsafe {
@@ -226,7 +231,7 @@ impl EGLDisplay {
             let weak_disp = WeakEGLDisplayHandle::from(new_display.clone());
 
             let mut displays = DISPLAYS.lock().unwrap();
-            displays.retain(|handle| handle.handle.upgrade().is_some());
+            displays.retain(|handle| handle.handle.strong_count() != 0);
             if displays.insert(weak_disp.clone()) {
                 new_display
             } else {

@@ -16,7 +16,7 @@ use tracing::{debug, error, info, info_span, instrument, trace};
 use xkbcommon::xkb::ffi::XKB_STATE_LAYOUT_EFFECTIVE;
 pub use xkbcommon::xkb::{self, keysyms, Keycode, Keysym};
 
-use super::{Seat, SeatHandler};
+use super::{GrabStatus, Seat, SeatHandler};
 
 #[cfg(feature = "wayland_frontend")]
 mod keymap_file;
@@ -50,12 +50,6 @@ where
     );
     /// Hold modifiers were changed on a keyboard from a given seat
     fn modifiers(&self, seat: &Seat<D>, data: &mut D, modifiers: ModifiersState, serial: Serial);
-}
-
-enum GrabStatus<D> {
-    None,
-    Active(Serial, Box<dyn KeyboardGrab<D>>),
-    Borrowed,
 }
 
 /// Mapping of the led of a keymap
@@ -133,7 +127,7 @@ pub(crate) struct KbdInternal<D: SeatHandler> {
     pub(crate) repeat_delay: i32,
     led_mapping: LedMapping,
     pub(crate) led_state: LedState,
-    grab: GrabStatus<D>,
+    grab: GrabStatus<dyn KeyboardGrab<D>>,
 }
 
 // focus_hook does not implement debug, so we have to impl Debug manually
@@ -213,9 +207,9 @@ impl<D: SeatHandler + 'static> KbdInternal<D> {
         (modifiers_changed, leds_changed)
     }
 
-    fn with_grab<F>(&mut self, seat: &Seat<D>, f: F)
+    fn with_grab<F>(&mut self, data: &mut D, seat: &Seat<D>, f: F)
     where
-        F: FnOnce(&mut KeyboardInnerHandle<'_, D>, &mut dyn KeyboardGrab<D>),
+        F: FnOnce(&mut D, &mut KeyboardInnerHandle<'_, D>, &mut dyn KeyboardGrab<D>),
     {
         let mut grab = std::mem::replace(&mut self.grab, GrabStatus::Borrowed);
         match grab {
@@ -224,15 +218,28 @@ impl<D: SeatHandler + 'static> KbdInternal<D> {
                 // If this grab is associated with a surface that is no longer alive, discard it
                 if let Some(ref surface) = handler.start_data().focus {
                     if !surface.alive() {
+                        handler.unset(data);
                         self.grab = GrabStatus::None;
-                        f(&mut KeyboardInnerHandle { inner: self, seat }, &mut DefaultGrab);
+                        f(
+                            data,
+                            &mut KeyboardInnerHandle { inner: self, seat },
+                            &mut DefaultGrab,
+                        );
                         return;
                     }
                 }
-                f(&mut KeyboardInnerHandle { inner: self, seat }, &mut **handler);
+                f(
+                    data,
+                    &mut KeyboardInnerHandle { inner: self, seat },
+                    &mut **handler,
+                );
             }
             GrabStatus::None => {
-                f(&mut KeyboardInnerHandle { inner: self, seat }, &mut DefaultGrab);
+                f(
+                    data,
+                    &mut KeyboardInnerHandle { inner: self, seat },
+                    &mut DefaultGrab,
+                );
             }
         }
 
@@ -555,6 +562,9 @@ pub trait KeyboardGrab<D: SeatHandler> {
 
     /// The data about the event that started the grab.
     fn start_data(&self) -> &GrabStartData<D>;
+
+    /// The grab has been unset or replaced with another grab.
+    fn unset(&mut self, data: &mut D);
 }
 
 /// An handle to a keyboard handler
@@ -579,6 +589,7 @@ impl<D: SeatHandler> fmt::Debug for KeyboardHandle<D> {
 }
 
 impl<D: SeatHandler> Clone for KeyboardHandle<D> {
+    #[inline]
     fn clone(&self) -> Self {
         KeyboardHandle {
             arc: self.arc.clone(),
@@ -587,6 +598,7 @@ impl<D: SeatHandler> Clone for KeyboardHandle<D> {
 }
 
 impl<D: SeatHandler> ::std::cmp::PartialEq for KeyboardHandle<D> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.arc, &other.arc)
     }
@@ -801,13 +813,21 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
     /// Change the current grab on this keyboard to the provided grab
     ///
     /// Overwrites any current grab.
-    pub fn set_grab<G: KeyboardGrab<D> + 'static>(&self, grab: G, serial: Serial) {
-        self.arc.internal.lock().unwrap().grab = GrabStatus::Active(serial, Box::new(grab));
+    pub fn set_grab<G: KeyboardGrab<D> + 'static>(&self, data: &mut D, grab: G, serial: Serial) {
+        let mut inner = self.arc.internal.lock().unwrap();
+        if let GrabStatus::Active(_, handler) = &mut inner.grab {
+            handler.unset(data);
+        }
+        inner.grab = GrabStatus::Active(serial, Box::new(grab));
     }
 
     /// Remove any current grab on this keyboard, resetting it to the default behavior
-    pub fn unset_grab(&self) {
-        self.arc.internal.lock().unwrap().grab = GrabStatus::None;
+    pub fn unset_grab(&self, data: &mut D) {
+        let mut inner = self.arc.internal.lock().unwrap();
+        if let GrabStatus::Active(_, handler) = &mut inner.grab {
+            handler.unset(data);
+        }
+        inner.grab = GrabStatus::None;
     }
 
     /// Check if this keyboard is currently grabbed with this serial
@@ -932,7 +952,7 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
         // forward to client if no keybinding is triggered
         let seat = self.get_seat(data);
         let modifiers = mods_changed.then_some(guard.mods_state);
-        guard.with_grab(&seat, |handle, grab| {
+        guard.with_grab(data, &seat, |data, handle, grab| {
             grab.input(data, handle, keycode, state, modifiers, serial, time);
         });
         if guard.focus.is_some() {
@@ -951,9 +971,9 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
     #[instrument(level = "debug", parent = &self.arc.span, skip(self, data, focus), fields(focus = focus.is_some()))]
     pub fn set_focus(&self, data: &mut D, focus: Option<<D as SeatHandler>::KeyboardFocus>, serial: Serial) {
         let mut guard = self.arc.internal.lock().unwrap();
-        guard.pending_focus = focus.clone();
+        guard.pending_focus.clone_from(&focus);
         let seat = self.get_seat(data);
-        guard.with_grab(&seat, |handle, grab| {
+        guard.with_grab(data, &seat, |data, handle, grab| {
             grab.set_focus(data, handle, focus, serial);
         });
     }
@@ -1068,7 +1088,14 @@ impl<'a, D: SeatHandler + 'static> KeyboardInnerHandle<'a, D> {
     /// Change the current grab on this keyboard to the provided grab
     ///
     /// Overwrites any current grab.
-    pub fn set_grab<G: KeyboardGrab<D> + 'static>(&mut self, _data: &mut D, serial: Serial, grab: G) {
+    pub fn set_grab<G: KeyboardGrab<D> + 'static>(
+        &mut self,
+        handler: &mut dyn KeyboardGrab<D>,
+        data: &mut D,
+        serial: Serial,
+        grab: G,
+    ) {
+        handler.unset(data);
         self.inner.grab = GrabStatus::Active(serial, Box::new(grab));
     }
 
@@ -1076,7 +1103,14 @@ impl<'a, D: SeatHandler + 'static> KeyboardInnerHandle<'a, D> {
     ///
     /// This will also restore the focus of the underlying keyboard if restore_focus
     /// is [`true`]
-    pub fn unset_grab(&mut self, data: &mut D, serial: Serial, restore_focus: bool) {
+    pub fn unset_grab(
+        &mut self,
+        handler: &mut dyn KeyboardGrab<D>,
+        data: &mut D,
+        serial: Serial,
+        restore_focus: bool,
+    ) {
+        handler.unset(data);
         self.inner.grab = GrabStatus::None;
         // restore the focus
         if restore_focus {
@@ -1247,4 +1281,6 @@ impl<D: SeatHandler + 'static> KeyboardGrab<D> for DefaultGrab {
     fn start_data(&self) -> &GrabStartData<D> {
         unreachable!()
     }
+
+    fn unset(&mut self, _data: &mut D) {}
 }

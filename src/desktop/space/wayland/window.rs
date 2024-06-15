@@ -45,7 +45,7 @@ impl SpaceElement for Window {
                 .unwrap()
                 .borrow_mut();
             state.output_overlap.insert(output.downgrade(), overlap);
-            state.output_overlap.retain(|weak, _| weak.upgrade().is_some());
+            state.output_overlap.retain(|weak, _| weak.is_alive());
         }
         self.refresh()
     }
@@ -56,9 +56,9 @@ impl SpaceElement for Window {
             state.borrow_mut().output_overlap.retain(|weak, _| weak != output);
         }
 
-        if let Some(surface) = &self.wl_surface() {
-            output_update(output, None, surface);
-            for (popup, _) in PopupManager::popups_for_surface(surface) {
+        if let Some(surface) = self.wl_surface() {
+            output_update(output, None, &surface);
+            for (popup, _) in PopupManager::popups_for_surface(&surface) {
                 output_update(output, None, popup.wl_surface());
             }
         }
@@ -69,11 +69,11 @@ impl SpaceElement for Window {
         self.user_data().insert_if_missing(WindowOutputUserData::default);
         let state = self.user_data().get::<WindowOutputUserData>().unwrap().borrow();
 
-        if let Some(surface) = &self.wl_surface() {
+        if let Some(surface) = self.wl_surface() {
             for (weak, overlap) in state.output_overlap.iter() {
                 if let Some(output) = weak.upgrade() {
-                    output_update(&output, Some(*overlap), surface);
-                    for (popup, location) in PopupManager::popups_for_surface(surface) {
+                    output_update(&output, Some(*overlap), &surface);
+                    for (popup, location) in PopupManager::popups_for_surface(&surface) {
                         let mut overlap = *overlap;
                         overlap.loc -= location;
                         output_update(&output, Some(overlap), popup.wl_surface());
@@ -87,7 +87,7 @@ impl SpaceElement for Window {
 impl<R> AsRenderElements<R> for Window
 where
     R: Renderer + ImportAll,
-    <R as Renderer>::TextureId: 'static,
+    <R as Renderer>::TextureId: Clone + 'static,
 {
     type RenderElement = WaylandSurfaceRenderElement<R>;
 

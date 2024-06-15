@@ -37,12 +37,14 @@ pub enum RenderZindex {
 }
 
 impl From<RenderZindex> for u8 {
+    #[inline]
     fn from(idx: RenderZindex) -> u8 {
         idx as u8
     }
 }
 
 impl From<RenderZindex> for Option<u8> {
+    #[inline]
     fn from(idx: RenderZindex) -> Option<u8> {
         Some(idx as u8)
     }
@@ -167,7 +169,7 @@ impl<
         E: AsRenderElements<R>,
     > AsRenderElements<R> for SpaceElements<'a, E>
 where
-    <R as Renderer>::TextureId: Texture + 'static,
+    <R as Renderer>::TextureId: Clone + Texture + 'static,
     <E as AsRenderElements<R>>::RenderElement: 'a,
     SpaceRenderElements<R, <E as AsRenderElements<R>>::RenderElement>:
         From<Wrap<<E as AsRenderElements<R>>::RenderElement>>,
@@ -263,6 +265,7 @@ macro_rules! space_elements_internal {
         $crate::desktop::space::SpaceElement::$name($($x),*)
     };
     (@alive $($(#[$meta:meta])* $body:ident=$field:ty),* $(,)?) => {
+        #[inline]
         fn alive(&self) -> bool {
             match self {
                 $(

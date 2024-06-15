@@ -57,18 +57,21 @@ pub struct Space<E: SpaceElement> {
 }
 
 impl<E: SpaceElement> PartialEq for Space<E> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
 }
 
 impl<E: SpaceElement> Drop for Space<E> {
+    #[inline]
     fn drop(&mut self) {
         SPACE_IDS.lock().unwrap().remove(&self.id);
     }
 }
 
 impl<E: SpaceElement> Default for Space<E> {
+    #[inline]
     fn default() -> Self {
         let id = next_space_id();
         let span = debug_span!("desktop_space", id);
@@ -367,6 +370,9 @@ impl<E: SpaceElement + PartialEq> Space<E> {
         }
 
         self.elements.iter().for_each(|e| e.element.refresh());
+        for (output, _) in outputs {
+            output.cleanup();
+        }
     }
 
     /// Retrieve the render elements for a given region of the space.
@@ -424,7 +430,7 @@ impl<E: SpaceElement + PartialEq> Space<E> {
         alpha: f32,
     ) -> Result<Vec<SpaceRenderElements<R, <E as AsRenderElements<R>>::RenderElement>>, OutputError>
     where
-        <R as Renderer>::TextureId: Texture + 'static,
+        <R as Renderer>::TextureId: Clone + Texture + 'static,
         E: AsRenderElements<R>,
         <E as AsRenderElements<R>>::RenderElement: 'a,
         SpaceRenderElements<R, <E as AsRenderElements<R>>::RenderElement>:
@@ -483,6 +489,7 @@ pub enum OutputError {
 }
 
 impl<E: IsAlive> IsAlive for InnerElement<E> {
+    #[inline]
     fn alive(&self) -> bool {
         self.element.alive()
     }
@@ -585,7 +592,7 @@ pub fn space_render_elements<
     alpha: f32,
 ) -> Result<Vec<SpaceRenderElements<R, <E as AsRenderElements<R>>::RenderElement>>, OutputNoMode>
 where
-    <R as Renderer>::TextureId: Texture + 'static,
+    <R as Renderer>::TextureId: Clone + Texture + 'static,
     <E as AsRenderElements<R>>::RenderElement: 'a,
     SpaceRenderElements<R, <E as AsRenderElements<R>>::RenderElement>:
         From<Wrap<<E as AsRenderElements<R>>::RenderElement>>,
@@ -680,7 +687,7 @@ pub fn render_output<
     clear_color: [f32; 4],
 ) -> Result<RenderOutputResult<'d>, OutputDamageTrackerError<R>>
 where
-    <R as Renderer>::TextureId: Texture + 'static,
+    <R as Renderer>::TextureId: Clone + Texture + 'static,
     <E as AsRenderElements<R>>::RenderElement: 'a,
     SpaceRenderElements<R, <E as AsRenderElements<R>>::RenderElement>:
         From<Wrap<<E as AsRenderElements<R>>::RenderElement>>,

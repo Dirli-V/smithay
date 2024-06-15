@@ -78,6 +78,8 @@ where
     fn start_data(&self) -> &KeyboardGrabStartData<D> {
         &KeyboardGrabStartData { focus: None }
     }
+
+    fn unset(&mut self, _data: &mut D) {}
 }
 
 /// User data of ZwpInputKeyboardGrabV2 object
@@ -99,13 +101,13 @@ impl<D: SeatHandler + 'static> Dispatch<ZwpInputMethodKeyboardGrabV2, InputMetho
     for InputMethodManagerState
 {
     fn destroyed(
-        _state: &mut D,
+        state: &mut D,
         _client: ClientId,
         _object: &ZwpInputMethodKeyboardGrabV2,
         data: &InputMethodKeyboardUserData<D>,
     ) {
         data.handle.inner.lock().unwrap().grab = None;
-        data.keyboard_handle.unset_grab();
+        data.keyboard_handle.unset_grab(state);
     }
 
     fn request(

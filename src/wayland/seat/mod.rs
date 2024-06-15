@@ -57,10 +57,10 @@
 //! to change the cursor icon.
 
 pub(crate) mod keyboard;
-mod pointer;
+pub(crate) mod pointer;
 mod touch;
 
-use std::{fmt, sync::Arc};
+use std::{borrow::Cow, fmt, sync::Arc};
 
 use crate::input::{Inner, Seat, SeatHandler, SeatRc, SeatState};
 
@@ -88,7 +88,7 @@ pub trait WaylandFocus {
     ///
     /// *Note*: This has to return `Some`, if `same_client_as` can return true
     /// for any provided `ObjectId`
-    fn wl_surface(&self) -> Option<wl_surface::WlSurface>;
+    fn wl_surface(&self) -> Option<Cow<'_, wl_surface::WlSurface>>;
     /// Returns true, if the underlying wayland object originates from
     /// the same client connection as the provided `ObjectId`.
     ///
@@ -101,8 +101,9 @@ pub trait WaylandFocus {
 }
 
 impl WaylandFocus for wl_surface::WlSurface {
-    fn wl_surface(&self) -> Option<wl_surface::WlSurface> {
-        Some(self.clone())
+    #[inline]
+    fn wl_surface(&self) -> Option<Cow<'_, wl_surface::WlSurface>> {
+        Some(Cow::Borrowed(self))
     }
 }
 
@@ -265,7 +266,7 @@ where
                 );
 
                 if let Some(ref ptr_handle) = inner.pointer {
-                    ptr_handle.new_pointer(pointer);
+                    ptr_handle.wl_pointer.new_pointer(pointer);
                 } else {
                     // we should send a protocol error... but the protocol does not allow
                     // us, so this pointer will just remain inactive ¯\_(ツ)_/¯

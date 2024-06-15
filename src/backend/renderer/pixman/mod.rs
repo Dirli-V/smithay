@@ -86,6 +86,7 @@ impl PixmanTarget {
 pub struct PixmanRenderBuffer(pixman::Image<'static, 'static>);
 
 impl From<pixman::Image<'static, 'static>> for PixmanRenderBuffer {
+    #[inline]
     fn from(value: pixman::Image<'static, 'static>) -> Self {
         Self(value)
     }
@@ -140,6 +141,7 @@ impl PixmanImage {
 pub struct PixmanTexture(PixmanImage);
 
 impl From<pixman::Image<'static, 'static>> for PixmanTexture {
+    #[inline]
     fn from(image: pixman::Image<'static, 'static>) -> Self {
         Self(PixmanImage(Rc::new(PixmanImageInner {
             #[cfg(feature = "wayland_frontend")]
@@ -346,6 +348,7 @@ impl<'frame> Frame for PixmanFrame<'frame> {
         src: Rectangle<f64, BufferCoords>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
         src_transform: Transform,
         alpha: f32,
     ) -> Result<(), Self::Error> {
@@ -656,7 +659,7 @@ pub struct PixmanRenderer {
 impl PixmanRenderer {
     /// Creates a new pixman renderer
     pub fn new() -> Result<Self, PixmanError> {
-        let tint = pixman::Solid::new([0.0, 0.3, 0.0, 0.2]).map_err(|_| PixmanError::Unsupported)?;
+        let tint = pixman::Solid::new([0.0, 0.2, 0.0, 0.2]).map_err(|_| PixmanError::Unsupported)?;
         Ok(Self {
             target: None,
             downscale_filter: TextureFilter::Linear,
@@ -744,7 +747,7 @@ impl PixmanRenderer {
                 .0
                 .dmabuf
                 .as_ref()
-                .map(|map| map.dmabuf.upgrade().is_some())
+                .map(|map| !map.dmabuf.is_gone())
                 .unwrap_or(false)
         });
         self.buffers.retain(|image| {
@@ -752,7 +755,7 @@ impl PixmanRenderer {
                 .0
                 .dmabuf
                 .as_ref()
-                .map(|map| map.dmabuf.upgrade().is_some())
+                .map(|map| !map.dmabuf.is_gone())
                 .unwrap_or(false)
         });
     }

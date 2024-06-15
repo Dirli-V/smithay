@@ -71,7 +71,7 @@ use crate::{
     },
     utils::{Buffer as BufferCoords, Physical, Rectangle, Size, Transform},
 };
-use tracing::{debug, info, info_span, instrument, trace, warn};
+use tracing::{debug, info, info_span, instrument, trace, trace_span, warn};
 #[cfg(feature = "wayland_frontend")]
 use wayland_server::protocol::{wl_buffer, wl_shm, wl_surface::WlSurface};
 
@@ -186,6 +186,7 @@ where
     <<R::Device as ApiDevice>::Renderer as Renderer>::Error: Into<SwapBuffersError> + Send + Sync,
     <<T::Device as ApiDevice>::Renderer as Renderer>::Error: Into<SwapBuffersError> + Send + Sync,
 {
+    #[inline]
     fn from(err: Error<R, T>) -> SwapBuffersError {
         match err {
             x @ Error::NoDevice(_) | x @ Error::DeviceMissing | x @ Error::AllocatorError(_) => {
@@ -540,7 +541,7 @@ impl<A: GraphicsApi> GpuManager<A> {
 
                 let mut devices = self.devices.iter_mut();
                 let first = devices.next().unwrap();
-                let src_node = import_on_src_node(&dmabuf, Some(damage), &mut texture, first, None, devices)?;
+                let src_node = import_on_src_node(dmabuf, Some(damage), &mut texture, first, None, devices)?;
 
                 if src_node != target_node {
                     let mut texture_internal = texture.0.borrow_mut();
@@ -1069,7 +1070,7 @@ where
             .render(size, dst_transform)
             .map_err(Error::Render)?;
 
-        let span = info_span!(
+        let span = trace_span!(
             parent: &self.span,
             "renderer_multi_frame",
             direct = target_texture.is_some(),
@@ -1095,13 +1096,13 @@ where
     }
 }
 
-fn create_shared_dma_framebuffer<R: GraphicsApi, T: GraphicsApi>(
+fn create_shared_dma_framebuffer<R, T: GraphicsApi>(
     buffer_size: Size<i32, BufferCoords>,
     src: &mut R::Device,
     target: &mut TargetData<'_, T>,
 ) -> Result<Dmabuf, Error<R, T>>
 where
-    R: 'static,
+    R: GraphicsApi + 'static,
     R::Error: 'static,
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
@@ -1211,6 +1212,7 @@ where
                             Rectangle::from_loc_and_size((0, 0), buffer_size).to_f64(),
                             Rectangle::from_loc_and_size((0, 0), self.size),
                             &damage,
+                            &[Rectangle::from_loc_and_size((0, 0), self.size)],
                             Transform::Normal,
                             1.0,
                         )
@@ -1299,7 +1301,15 @@ where
                         let damage = &[Rectangle::from_loc_and_size((0, 0), dst.size)];
                         frame.clear([0.0, 0.0, 0.0, 0.0], &[dst]).map_err(Error::Target)?;
                         frame
-                            .render_texture_from_to(&texture, src, dst, damage, Transform::Normal, 1.0)
+                            .render_texture_from_to(
+                                &texture,
+                                src,
+                                dst,
+                                damage,
+                                &[Rectangle::from_loc_and_size((0, 0), self.size)],
+                                Transform::Normal,
+                                1.0,
+                            )
                             .map_err(Error::Target)?;
                     }
                 }
@@ -1613,6 +1623,7 @@ where
         src: Rectangle<f64, BufferCoords>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
         src_transform: Transform,
         alpha: f32,
     ) -> Result<(), Error<R, T>> {
@@ -1631,7 +1642,7 @@ where
             self.frame
                 .as_mut()
                 .unwrap()
-                .render_texture_from_to(&texture, src, dst, damage, src_transform, alpha)
+                .render_texture_from_to(&texture, src, dst, damage, opaque_regions, src_transform, alpha)
                 .map_err(Error::Render)
         } else {
             warn!(
@@ -1776,7 +1787,7 @@ where
         let dmabuf = get_dmabuf(buffer).expect("import_dma_buffer without checking buffer type?");
         let texture = MultiTexture::from_surface(surface, dmabuf.size());
         let texture_ref = texture.0.clone();
-        let res = self.import_dmabuf_internal(&dmabuf, texture, Some(damage));
+        let res = self.import_dmabuf_internal(dmabuf, texture, Some(damage));
         if res.is_ok() {
             if let Some(surface) = surface {
                 surface.data_map.insert_if_missing(|| texture_ref);
@@ -1985,6 +1996,7 @@ where
             Rectangle::from_loc_and_size((0, 0), src_texture.size()).to_f64(),
             Rectangle::from_loc_and_size((0, 0), shadow_size),
             damage,
+            &[],
             Transform::Normal,
             1.0,
         )

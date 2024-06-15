@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState},
-    input::{Seat, SeatHandler},
+    input::{GrabStatus, Seat, SeatHandler},
     utils::Serial,
     utils::{IsAlive, Logical, Point},
 };
@@ -17,7 +17,7 @@ pub use cursor_icon::CursorIcon;
 pub use cursor_image::{CursorImageAttributes, CursorImageStatus, CursorImageSurfaceData};
 
 mod grab;
-use grab::{DefaultGrab, GrabStatus};
+use grab::DefaultGrab;
 pub use grab::{GrabStartData, PointerGrab};
 use tracing::{info_span, instrument};
 
@@ -33,17 +33,11 @@ use tracing::{info_span, instrument};
 pub struct PointerHandle<D: SeatHandler> {
     pub(crate) inner: Arc<Mutex<PointerInternal<D>>>,
     #[cfg(feature = "wayland_frontend")]
-    pub(crate) last_enter: Arc<Mutex<Option<Serial>>>,
+    pub(crate) wl_pointer: Arc<crate::wayland::seat::pointer::WlPointerHandle>,
     #[cfg(feature = "wayland_frontend")]
-    pub(crate) known_pointers: Arc<Mutex<Vec<wayland_server::protocol::wl_pointer::WlPointer>>>,
+    pub(crate) wp_pointer_gestures: Arc<crate::wayland::pointer_gestures::WpPointerGesturePointerHandle>,
     #[cfg(feature = "wayland_frontend")]
-    pub(crate) known_relative_pointers: Arc<Mutex<Vec<wayland_protocols::wp::relative_pointer::zv1::server::zwp_relative_pointer_v1::ZwpRelativePointerV1>>>,
-    #[cfg(feature = "wayland_frontend")]
-    pub(crate) known_swipe_gestures: Arc<Mutex<Vec<wayland_protocols::wp::pointer_gestures::zv1::server::zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1>>>,
-    #[cfg(feature = "wayland_frontend")]
-    pub(crate) known_pinch_gestures: Arc<Mutex<Vec<wayland_protocols::wp::pointer_gestures::zv1::server::zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>>>,
-    #[cfg(feature = "wayland_frontend")]
-    pub(crate) known_hold_gestures: Arc<Mutex<Vec<wayland_protocols::wp::pointer_gestures::zv1::server::zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1>>>,
+    pub(crate) wp_relative: Arc<crate::wayland::relative_pointer::WpRelativePointerHandle>,
     pub(crate) span: tracing::Span,
 }
 
@@ -61,44 +55,38 @@ impl<D: SeatHandler> fmt::Debug for PointerHandle<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PointerHandle")
             .field("inner", &self.inner)
-            .field("last_enter", &self.last_enter)
-            .field("known_pointers", &self.known_pointers)
-            .field("known_relative_pointers", &self.known_relative_pointers)
-            .field("known_swipe_gestures", &self.known_swipe_gestures)
-            .field("known_pinch_gestures", &self.known_pinch_gestures)
-            .field("known_hold_gestures", &self.known_hold_gestures)
+            .field("wl_seat", &self.wl_pointer)
+            .field("wp_pointer_gestures", &self.wp_pointer_gestures)
+            .field("wp_relative", &self.wp_relative)
             .finish()
     }
 }
 
 impl<D: SeatHandler> Clone for PointerHandle<D> {
+    #[inline]
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             #[cfg(feature = "wayland_frontend")]
-            last_enter: self.last_enter.clone(),
+            wl_pointer: self.wl_pointer.clone(),
             #[cfg(feature = "wayland_frontend")]
-            known_pointers: self.known_pointers.clone(),
+            wp_pointer_gestures: self.wp_pointer_gestures.clone(),
             #[cfg(feature = "wayland_frontend")]
-            known_relative_pointers: self.known_relative_pointers.clone(),
-            #[cfg(feature = "wayland_frontend")]
-            known_swipe_gestures: self.known_swipe_gestures.clone(),
-            #[cfg(feature = "wayland_frontend")]
-            known_pinch_gestures: self.known_pinch_gestures.clone(),
-            #[cfg(feature = "wayland_frontend")]
-            known_hold_gestures: self.known_hold_gestures.clone(),
+            wp_relative: self.wp_relative.clone(),
             span: self.span.clone(),
         }
     }
 }
 
 impl<D: SeatHandler> std::hash::Hash for PointerHandle<D> {
+    #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         Arc::as_ptr(&self.inner).hash(state)
     }
 }
 
 impl<D: SeatHandler> std::cmp::PartialEq for PointerHandle<D> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -160,17 +148,13 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
         PointerHandle {
             inner: Arc::new(Mutex::new(PointerInternal::new())),
             #[cfg(feature = "wayland_frontend")]
-            last_enter: Arc::new(Mutex::new(None)),
+            wl_pointer: Arc::new(crate::wayland::seat::pointer::WlPointerHandle::default()),
             #[cfg(feature = "wayland_frontend")]
-            known_pointers: Arc::new(Mutex::new(Vec::new())),
+            wp_pointer_gestures: Arc::new(
+                crate::wayland::pointer_gestures::WpPointerGesturePointerHandle::default(),
+            ),
             #[cfg(feature = "wayland_frontend")]
-            known_relative_pointers: Arc::new(Mutex::new(Vec::new())),
-            #[cfg(feature = "wayland_frontend")]
-            known_swipe_gestures: Arc::new(Mutex::new(Vec::new())),
-            #[cfg(feature = "wayland_frontend")]
-            known_pinch_gestures: Arc::new(Mutex::new(Vec::new())),
-            #[cfg(feature = "wayland_frontend")]
-            known_hold_gestures: Arc::new(Mutex::new(Vec::new())),
+            wp_relative: Arc::new(crate::wayland::relative_pointer::WpRelativePointerHandle::default()),
             span: info_span!("input_pointer"),
         }
     }
@@ -242,9 +226,9 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
         event: &MotionEvent,
     ) {
         let mut inner = self.inner.lock().unwrap();
-        inner.pending_focus = focus.clone();
+        inner.pending_focus.clone_from(&focus);
         let seat = self.get_seat(data);
-        inner.with_grab(&seat, |handle, grab| {
+        inner.with_grab(data, &seat, |data, handle, grab| {
             grab.motion(data, handle, focus, event);
         });
     }
@@ -262,9 +246,9 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
         event: &RelativeMotionEvent,
     ) {
         let mut inner = self.inner.lock().unwrap();
-        inner.pending_focus = focus.clone();
+        inner.pending_focus.clone_from(&focus);
         let seat = self.get_seat(data);
-        inner.with_grab(&seat, |handle, grab| {
+        inner.with_grab(data, &seat, |data, handle, grab| {
             grab.relative_motion(data, handle, focus, event);
         });
     }
@@ -285,7 +269,7 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
             }
         }
         let seat = self.get_seat(data);
-        inner.with_grab(&seat, |handle, grab| {
+        inner.with_grab(data, &seat, |data, handle, grab| {
             grab.button(data, handle, event);
         });
     }
@@ -296,9 +280,12 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
     #[instrument(level = "trace", parent = &self.span, skip(self, data))]
     pub fn axis(&self, data: &mut D, details: AxisFrame) {
         let seat = self.get_seat(data);
-        self.inner.lock().unwrap().with_grab(&seat, |handle, grab| {
-            grab.axis(data, handle, details);
-        });
+        self.inner
+            .lock()
+            .unwrap()
+            .with_grab(data, &seat, |data, handle, grab| {
+                grab.axis(data, handle, details);
+            });
     }
 
     /// End of a pointer frame
@@ -307,9 +294,12 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
     #[instrument(level = "trace", parent = &self.span, skip(self, data))]
     pub fn frame(&self, data: &mut D) {
         let seat = self.get_seat(data);
-        self.inner.lock().unwrap().with_grab(&seat, |handle, grab| {
-            grab.frame(data, handle);
-        });
+        self.inner
+            .lock()
+            .unwrap()
+            .with_grab(data, &seat, |data, handle, grab| {
+                grab.frame(data, handle);
+            });
     }
 
     /// Notify about swipe gesture begin
@@ -320,9 +310,12 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
     #[instrument(level = "trace", parent = &self.span, skip(self, data))]
     pub fn gesture_swipe_begin(&self, data: &mut D, event: &GestureSwipeBeginEvent) {
         let seat = self.get_seat(data);
-        self.inner.lock().unwrap().with_grab(&seat, |handle, grab| {
-            grab.gesture_swipe_begin(data, handle, event);
-        });
+        self.inner
+            .lock()
+            .unwrap()
+            .with_grab(data, &seat, |data, handle, grab| {
+                grab.gesture_swipe_begin(data, handle, event);
+            });
     }
 
     /// Notify about swipe gesture update
@@ -333,9 +326,12 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
     #[instrument(level = "trace", parent = &self.span, skip(self, data))]
     pub fn gesture_swipe_update(&self, data: &mut D, event: &GestureSwipeUpdateEvent) {
         let seat = self.get_seat(data);
-        self.inner.lock().unwrap().with_grab(&seat, |handle, grab| {
-            grab.gesture_swipe_update(data, handle, event);
-        });
+        self.inner
+            .lock()
+            .unwrap()
+            .with_grab(data, &seat, |data, handle, grab| {
+                grab.gesture_swipe_update(data, handle, event);
+            });
     }
 
     /// Notify about swipe gesture end
@@ -346,9 +342,12 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
     #[instrument(level = "trace", parent = &self.span, skip(self, data))]
     pub fn gesture_swipe_end(&self, data: &mut D, event: &GestureSwipeEndEvent) {
         let seat = self.get_seat(data);
-        self.inner.lock().unwrap().with_grab(&seat, |handle, grab| {
-            grab.gesture_swipe_end(data, handle, event);
-        });
+        self.inner
+            .lock()
+            .unwrap()
+            .with_grab(data, &seat, |data, handle, grab| {
+                grab.gesture_swipe_end(data, handle, event);
+            });
     }
 
     /// Notify about pinch gesture begin
@@ -359,9 +358,12 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
     #[instrument(level = "trace", parent = &self.span, skip(self, data))]
     pub fn gesture_pinch_begin(&self, data: &mut D, event: &GesturePinchBeginEvent) {
         let seat = self.get_seat(data);
-        self.inner.lock().unwrap().with_grab(&seat, |handle, grab| {
-            grab.gesture_pinch_begin(data, handle, event);
-        });
+        self.inner
+            .lock()
+            .unwrap()
+            .with_grab(data, &seat, |data, handle, grab| {
+                grab.gesture_pinch_begin(data, handle, event);
+            });
     }
 
     /// Notify about pinch gesture update
@@ -372,9 +374,12 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
     #[instrument(level = "trace", parent = &self.span, skip(self, data))]
     pub fn gesture_pinch_update(&self, data: &mut D, event: &GesturePinchUpdateEvent) {
         let seat = self.get_seat(data);
-        self.inner.lock().unwrap().with_grab(&seat, |handle, grab| {
-            grab.gesture_pinch_update(data, handle, event);
-        });
+        self.inner
+            .lock()
+            .unwrap()
+            .with_grab(data, &seat, |data, handle, grab| {
+                grab.gesture_pinch_update(data, handle, event);
+            });
     }
 
     /// Notify about pinch gesture end
@@ -385,9 +390,12 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
     #[instrument(level = "trace", parent = &self.span, skip(self, data))]
     pub fn gesture_pinch_end(&self, data: &mut D, event: &GesturePinchEndEvent) {
         let seat = self.get_seat(data);
-        self.inner.lock().unwrap().with_grab(&seat, |handle, grab| {
-            grab.gesture_pinch_end(data, handle, event);
-        });
+        self.inner
+            .lock()
+            .unwrap()
+            .with_grab(data, &seat, |data, handle, grab| {
+                grab.gesture_pinch_end(data, handle, event);
+            });
     }
 
     /// Notify about hold gesture begin
@@ -398,9 +406,12 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
     #[instrument(level = "trace", parent = &self.span, skip(self, data))]
     pub fn gesture_hold_begin(&self, data: &mut D, event: &GestureHoldBeginEvent) {
         let seat = self.get_seat(data);
-        self.inner.lock().unwrap().with_grab(&seat, |handle, grab| {
-            grab.gesture_hold_begin(data, handle, event);
-        });
+        self.inner
+            .lock()
+            .unwrap()
+            .with_grab(data, &seat, |data, handle, grab| {
+                grab.gesture_hold_begin(data, handle, event);
+            });
     }
 
     /// Notify about hold gesture end
@@ -411,9 +422,12 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
     #[instrument(level = "trace", parent = &self.span, skip(self, data))]
     pub fn gesture_hold_end(&self, data: &mut D, event: &GestureHoldEndEvent) {
         let seat = self.get_seat(data);
-        self.inner.lock().unwrap().with_grab(&seat, |handle, grab| {
-            grab.gesture_hold_end(data, handle, event);
-        });
+        self.inner
+            .lock()
+            .unwrap()
+            .with_grab(data, &seat, |data, handle, grab| {
+                grab.gesture_hold_end(data, handle, event);
+            });
     }
 
     /// Access the current location of this pointer in the global space
@@ -423,10 +437,10 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
 
     /// Access the [`Serial`] of the last `pointer_enter` event, if that focus is still active.
     ///
-    /// In other words this will return `None` again, once a `pointer_leave` event occured.
+    /// In other words this will return `None` again, once a `pointer_leave` event occurred.
     #[cfg(feature = "wayland_frontend")]
     pub fn last_enter(&self) -> Option<Serial> {
-        *self.last_enter.lock().unwrap()
+        *self.wl_pointer.last_enter.lock().unwrap()
     }
 
     fn get_seat(&self, data: &mut D) -> Seat<D> {
@@ -473,11 +487,13 @@ impl<'a, D: SeatHandler + 'static> PointerInnerHandle<'a, D> {
     /// Overwrites any current grab.
     pub fn set_grab<G: PointerGrab<D> + 'static>(
         &mut self,
+        handler: &mut dyn PointerGrab<D>,
         data: &mut D,
         serial: Serial,
         focus: Focus,
         grab: G,
     ) {
+        handler.unset(data);
         self.inner.set_grab(data, self.seat, serial, grab, focus);
     }
 
@@ -485,7 +501,15 @@ impl<'a, D: SeatHandler + 'static> PointerInnerHandle<'a, D> {
     ///
     /// This will also restore the focus of the underlying pointer if restore_focus
     /// is [`true`]
-    pub fn unset_grab(&mut self, data: &mut D, serial: Serial, time: u32, restore_focus: bool) {
+    pub fn unset_grab(
+        &mut self,
+        handler: &mut dyn PointerGrab<D>,
+        data: &mut D,
+        serial: Serial,
+        time: u32,
+        restore_focus: bool,
+    ) {
+        handler.unset(data);
         self.inner
             .unset_grab(data, self.seat, serial, time, restore_focus);
     }
@@ -649,7 +673,7 @@ pub(crate) struct PointerInternal<D: SeatHandler> {
     pub(crate) focus: Option<(<D as SeatHandler>::PointerFocus, Point<i32, Logical>)>,
     pending_focus: Option<(<D as SeatHandler>::PointerFocus, Point<i32, Logical>)>,
     location: Point<f64, Logical>,
-    grab: GrabStatus<D>,
+    grab: GrabStatus<dyn PointerGrab<D>>,
     pressed_buttons: Vec<u32>,
 }
 
@@ -686,6 +710,9 @@ impl<D: SeatHandler + 'static> PointerInternal<D> {
         grab: G,
         focus: Focus,
     ) {
+        if let GrabStatus::Active(_, handler) = &mut self.grab {
+            handler.unset(data);
+        }
         self.grab = GrabStatus::Active(serial, Box::new(grab));
 
         if matches!(focus, Focus::Clear) {
@@ -704,6 +731,9 @@ impl<D: SeatHandler + 'static> PointerInternal<D> {
     }
 
     fn unset_grab(&mut self, data: &mut D, seat: &Seat<D>, serial: Serial, time: u32, restore_focus: bool) {
+        if let GrabStatus::Active(_, handler) = &mut self.grab {
+            handler.unset(data);
+        }
         self.grab = GrabStatus::None;
         if restore_focus {
             // restore the focus
@@ -817,9 +847,9 @@ impl<D: SeatHandler + 'static> PointerInternal<D> {
         }
     }
 
-    fn with_grab<F>(&mut self, seat: &Seat<D>, f: F)
+    fn with_grab<F>(&mut self, data: &mut D, seat: &Seat<D>, f: F)
     where
-        F: FnOnce(&mut PointerInnerHandle<'_, D>, &mut dyn PointerGrab<D>),
+        F: FnOnce(&mut D, &mut PointerInnerHandle<'_, D>, &mut dyn PointerGrab<D>),
     {
         let mut grab = std::mem::replace(&mut self.grab, GrabStatus::Borrowed);
         match grab {
@@ -828,20 +858,33 @@ impl<D: SeatHandler + 'static> PointerInternal<D> {
                 // If this grab is associated with a surface that is no longer alive, discard it
                 if let Some((ref focus, _)) = handler.start_data().focus {
                     if !focus.alive() {
+                        handler.unset(data);
                         self.grab = GrabStatus::None;
-                        f(&mut PointerInnerHandle { inner: self, seat }, &mut DefaultGrab);
+                        f(
+                            data,
+                            &mut PointerInnerHandle { inner: self, seat },
+                            &mut DefaultGrab,
+                        );
                         return;
                     }
                 }
-                f(&mut PointerInnerHandle { inner: self, seat }, &mut **handler);
+                f(
+                    data,
+                    &mut PointerInnerHandle { inner: self, seat },
+                    &mut **handler,
+                );
             }
             GrabStatus::None => {
-                f(&mut PointerInnerHandle { inner: self, seat }, &mut DefaultGrab);
+                f(
+                    data,
+                    &mut PointerInnerHandle { inner: self, seat },
+                    &mut DefaultGrab,
+                );
             }
         }
 
         if let GrabStatus::Borrowed = self.grab {
-            // the grab has not been ended nor replaced, put it back in place
+            // The grab has not been ended nor replaced, put it back in place
             self.grab = grab;
         }
     }
@@ -911,6 +954,7 @@ pub struct ButtonEvent {
 ///     .value(Axis::Vertical, 30, time)
 ///     .stop(Axis::Vertical);
 /// ```
+#[must_use = "AxisFrame uses a builder-like pattern, so its result must be used"]
 #[derive(Copy, Clone, Debug)]
 pub struct AxisFrame {
     /// Source of the axis event, if known
@@ -923,7 +967,7 @@ pub struct AxisFrame {
     pub axis: (f64, f64),
     /// Discrete representation of scroll value per axis, if available
     pub v120: Option<(i32, i32)>,
-    /// If the axis is considered having stoped movement
+    /// If the axis is considered having stopped movement
     ///
     /// Only useful in conjunction of AxisSource::Finger events
     pub stop: (bool, bool),

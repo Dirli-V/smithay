@@ -40,6 +40,7 @@ pub struct State {
 }
 
 impl PartialEq for State {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.active == other.active && self.mode == other.mode && self.connectors == other.connectors
     }
@@ -282,7 +283,7 @@ impl AtomicDrmSurface {
     fn ensure_props_known(&self, conns: &[connector::Handle]) -> Result<(), Error> {
         let mapping_exists = {
             let prop_mapping = self.prop_mapping.read().unwrap();
-            conns.iter().all(|conn| prop_mapping.0.get(conn).is_some())
+            conns.iter().all(|conn| prop_mapping.0.contains_key(conn))
         };
         if !mapping_exists {
             map_props(
@@ -1194,6 +1195,7 @@ bitflags::bitflags! {
 }
 
 impl From<Transform> for DrmRotation {
+    #[inline]
     fn from(transform: Transform) -> Self {
         match transform {
             Transform::Normal => DrmRotation::ROTATE_0,

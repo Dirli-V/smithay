@@ -64,6 +64,7 @@ pub enum TextureFilter {
 
 impl Transform {
     /// A projection matrix to apply this transformation
+    #[inline]
     pub fn matrix(&self) -> Matrix3<f32> {
         match self {
             Transform::Normal => Matrix3::new(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
@@ -80,6 +81,7 @@ impl Transform {
 
 #[cfg(feature = "wayland_frontend")]
 impl From<wayland_server::protocol::wl_output::Transform> for Transform {
+    #[inline]
     fn from(transform: wayland_server::protocol::wl_output::Transform) -> Transform {
         use wayland_server::protocol::wl_output::Transform as WlTransform;
         match transform {
@@ -192,6 +194,7 @@ pub trait Frame {
         output_scale: impl Into<Scale<f64>>,
         src_transform: Transform,
         damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
         alpha: f32,
     ) -> Result<(), Self::Error> {
         self.render_texture_from_to(
@@ -205,6 +208,7 @@ pub trait Frame {
                     .to_physical_precise_round(output_scale),
             ),
             damage,
+            opaque_regions,
             src_transform,
             alpha,
         )
@@ -213,12 +217,14 @@ pub trait Frame {
     /// Render part of a texture as given by src to the current target into the rectangle described by dst
     /// as a flat 2d-plane after applying the inverse of the given transformation.
     /// (Meaning `src_transform` should match the orientation of surface being rendered).
+    #[allow(clippy::too_many_arguments)]
     fn render_texture_from_to(
         &mut self,
         texture: &Self::TextureId,
         src: Rectangle<f64, BufferCoord>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
         src_transform: Transform,
         alpha: f32,
     ) -> Result<(), Self::Error>;
@@ -473,7 +479,7 @@ pub trait ImportDmaWl: ImportDma {
     ) -> Result<<Self as Renderer>::TextureId, <Self as Renderer>::Error> {
         let dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
             .expect("import_dma_buffer without checking buffer type?");
-        self.import_dmabuf(&dmabuf, Some(damage))
+        self.import_dmabuf(dmabuf, Some(damage))
     }
 }
 

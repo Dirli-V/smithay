@@ -18,6 +18,7 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use wayland_server::protocol::wl_surface::{self, WlSurface};
 
 use std::{
+    borrow::Cow,
     cell::{RefCell, RefMut},
     hash::{Hash, Hasher},
     sync::Arc,
@@ -473,6 +474,7 @@ pub fn layer_state(layer: &LayerSurface) -> RefMut<'_, LayerState> {
 pub struct LayerSurface(pub(crate) Arc<LayerSurfaceInner>);
 
 impl PartialEq for LayerSurface {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.0.id == other.0.id
     }
@@ -481,6 +483,7 @@ impl PartialEq for LayerSurface {
 impl Eq for LayerSurface {}
 
 impl Hash for LayerSurface {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.id.hash(state);
     }
@@ -495,12 +498,14 @@ pub(crate) struct LayerSurfaceInner {
 }
 
 impl Drop for LayerSurfaceInner {
+    #[inline]
     fn drop(&mut self) {
         LAYER_IDS.lock().unwrap().remove(&self.id);
     }
 }
 
 impl IsAlive for LayerSurface {
+    #[inline]
     fn alive(&self) -> bool {
         self.0.surface.alive()
     }
@@ -523,6 +528,7 @@ impl LayerSurface {
     }
 
     /// Returns the underlying [`WlSurface`]
+    #[inline]
     pub fn wl_surface(&self) -> &WlSurface {
         self.0.surface.wl_surface()
     }
@@ -705,7 +711,8 @@ impl LayerSurface {
 }
 
 impl WaylandFocus for LayerSurface {
-    fn wl_surface(&self) -> Option<wl_surface::WlSurface> {
-        Some(self.0.surface.wl_surface().clone())
+    #[inline]
+    fn wl_surface(&self) -> Option<Cow<'_, wl_surface::WlSurface>> {
+        Some(Cow::Borrowed(self.0.surface.wl_surface()))
     }
 }

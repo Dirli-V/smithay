@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::{
@@ -17,8 +19,9 @@ use crate::{
 use super::{output_update, WindowOutputUserData};
 
 impl WaylandFocus for X11Surface {
-    fn wl_surface(&self) -> Option<WlSurface> {
-        self.state.lock().unwrap().wl_surface.clone()
+    #[inline]
+    fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
+        self.state.lock().unwrap().wl_surface.clone().map(Cow::Owned)
     }
 }
 
@@ -50,7 +53,7 @@ impl SpaceElement for X11Surface {
                 .unwrap()
                 .borrow_mut();
             state.output_overlap.insert(output.downgrade(), overlap);
-            state.output_overlap.retain(|weak, _| weak.upgrade().is_some());
+            state.output_overlap.retain(|weak, _| weak.is_alive());
         }
         self.refresh()
     }
@@ -94,7 +97,7 @@ impl SpaceElement for X11Surface {
 impl<R> crate::backend::renderer::element::AsRenderElements<R> for X11Surface
 where
     R: Renderer + ImportAll,
-    <R as Renderer>::TextureId: 'static,
+    <R as Renderer>::TextureId: Clone + 'static,
 {
     type RenderElement = WaylandSurfaceRenderElement<R>;
 

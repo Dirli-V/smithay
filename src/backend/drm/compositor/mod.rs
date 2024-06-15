@@ -129,7 +129,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use ::gbm::{BufferObject, BufferObjectFlags};
 use drm::{
     control::{connector, crtc, framebuffer, plane, Mode, PlaneType},
     Device, DriverCapability,
@@ -150,7 +149,7 @@ use crate::{
         allocator::{
             dmabuf::{AsDmabuf, Dmabuf},
             format::{get_opaque, has_alpha},
-            gbm::{GbmAllocator, GbmDevice},
+            gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice},
             Allocator, Buffer, Slot, Swapchain,
         },
         drm::{plane_has_property, DrmError, PlaneDamageClips},
@@ -162,7 +161,7 @@ use crate::{
                 RenderElementStates, RenderingReason, UnderlyingStorage,
             },
             sync::SyncPoint,
-            utils::{CommitCounter, DamageBag, DamageSet, DamageSnapshot},
+            utils::{CommitCounter, DamageBag, DamageSet, DamageSnapshot, OpaqueRegions},
             Bind, Blit, DebugFlags, Frame as RendererFrame, Renderer, Texture,
         },
         SwapBuffersError,
@@ -201,13 +200,14 @@ impl RenderElementState {
 enum ScanoutBuffer<B: Buffer> {
     Wayland(crate::backend::renderer::utils::Buffer),
     Swapchain(Slot<B>),
-    Cursor(BufferObject<()>),
+    Cursor(GbmBuffer),
 }
 
 impl<B: Buffer> ScanoutBuffer<B> {
-    fn from_underlying_storage(storage: UnderlyingStorage) -> Option<Self> {
+    #[inline]
+    fn from_underlying_storage(storage: UnderlyingStorage<'_>) -> Option<Self> {
         match storage {
-            UnderlyingStorage::Wayland(buffer) => Some(Self::Wayland(buffer)),
+            UnderlyingStorage::Wayland(buffer) => Some(Self::Wayland(buffer.clone())),
             UnderlyingStorage::Memory { .. } => None,
         }
     }
@@ -222,6 +222,7 @@ impl<F> AsRef<framebuffer::Handle> for DrmFramebuffer<F>
 where
     F: Framebuffer,
 {
+    #[inline]
     fn as_ref(&self) -> &framebuffer::Handle {
         match self {
             DrmFramebuffer::Exporter(e) => e.as_ref(),
@@ -234,6 +235,7 @@ impl<F> Framebuffer for DrmFramebuffer<F>
 where
     F: Framebuffer,
 {
+    #[inline]
     fn format(&self) -> drm_fourcc::DrmFormat {
         match self {
             DrmFramebuffer::Exporter(e) => e.format(),
@@ -273,12 +275,14 @@ where
 }
 
 impl<B: Buffer, F: Framebuffer> AsRef<framebuffer::Handle> for DrmScanoutBuffer<B, F> {
+    #[inline]
     fn as_ref(&self) -> &drm::control::framebuffer::Handle {
         self.fb.as_ref()
     }
 }
 
 impl<B: Buffer, F: Framebuffer> Framebuffer for DrmScanoutBuffer<B, F> {
+    #[inline]
     fn format(&self) -> drm_fourcc::DrmFormat {
         self.fb.format()
     }
@@ -290,7 +294,8 @@ enum ElementFramebufferCacheBuffer {
 }
 
 impl ElementFramebufferCacheBuffer {
-    fn from_underlying_storage(storage: &UnderlyingStorage) -> Option<Self> {
+    #[inline]
+    fn from_underlying_storage(storage: &UnderlyingStorage<'_>) -> Option<Self> {
         match storage {
             UnderlyingStorage::Wayland(buffer) => Some(Self::Wayland(buffer.downgrade())),
             UnderlyingStorage::Memory { .. } => None,
@@ -305,7 +310,8 @@ struct ElementFramebufferCacheKey {
 }
 
 impl ElementFramebufferCacheKey {
-    fn from_underlying_storage(storage: &UnderlyingStorage, allow_opaque_fallback: bool) -> Option<Self> {
+    #[inline]
+    fn from_underlying_storage(storage: &UnderlyingStorage<'_>, allow_opaque_fallback: bool) -> Option<Self> {
         let buffer = ElementFramebufferCacheBuffer::from_underlying_storage(storage)?;
         Some(Self {
             allow_opaque_fallback,
@@ -315,6 +321,7 @@ impl ElementFramebufferCacheKey {
 }
 
 impl ElementFramebufferCacheKey {
+    #[inline]
     fn is_alive(&self) -> bool {
         match self.buffer {
             ElementFramebufferCacheBuffer::Wayland(ref buffer) => buffer.upgrade().is_ok(),
@@ -348,41 +355,43 @@ where
     B: Framebuffer,
 {
     /// Cache for framebuffer handles per cache key (e.g. wayland buffer)
-    fb_cache: HashMap<ElementFramebufferCacheKey, Result<OwnedFramebuffer<B>, ExportBufferError>>,
+    fb_cache: SmallVec<
+        [(
+            ElementFramebufferCacheKey,
+            Result<OwnedFramebuffer<B>, ExportBufferError>,
+        ); 4],
+    >,
 }
 
 impl<B> ElementFramebufferCache<B>
 where
     B: Framebuffer,
 {
+    #[inline]
     fn get(
         &self,
         cache_key: &ElementFramebufferCacheKey,
-    ) -> Option<Result<OwnedFramebuffer<B>, ExportBufferError>> {
-        self.fb_cache.get(cache_key).cloned()
+    ) -> Option<Result<&OwnedFramebuffer<B>, ExportBufferError>> {
+        self.fb_cache.iter().find_map(|(k, r)| {
+            if k == cache_key {
+                Some(r.as_ref().map_err(|err| *err))
+            } else {
+                None
+            }
+        })
     }
 
+    #[inline]
     fn insert(
         &mut self,
         cache_key: ElementFramebufferCacheKey,
         fb: Result<OwnedFramebuffer<B>, ExportBufferError>,
     ) {
-        self.fb_cache.insert(cache_key, fb);
+        self.fb_cache.push((cache_key, fb));
     }
 
     fn cleanup(&mut self) {
-        self.fb_cache.retain(|key, _| key.is_alive());
-    }
-}
-
-impl<B> Clone for ElementFramebufferCache<B>
-where
-    B: Framebuffer,
-{
-    fn clone(&self) -> Self {
-        Self {
-            fb_cache: self.fb_cache.clone(),
-        }
+        self.fb_cache.retain(|(key, _)| key.is_alive());
     }
 }
 
@@ -390,6 +399,7 @@ impl<B> Default for ElementFramebufferCache<B>
 where
     B: Framebuffer,
 {
+    #[inline]
     fn default() -> Self {
         Self {
             fb_cache: Default::default(),
@@ -407,6 +417,7 @@ struct PlaneProperties {
 }
 
 impl PlaneProperties {
+    #[inline]
     fn is_compatible(&self, other: &PlaneProperties) -> bool {
         self.src == other.src
             && self.dst == other.dst
@@ -434,12 +445,14 @@ struct PlaneConfig<B> {
 }
 
 impl<B> PlaneConfig<B> {
+    #[inline]
     pub fn is_compatible(&self, other: &PlaneConfig<B>) -> bool {
         self.properties.is_compatible(&other.properties)
     }
 }
 
 impl<B> Clone for PlaneConfig<B> {
+    #[inline]
     fn clone(&self) -> Self {
         Self {
             properties: self.properties,
@@ -467,6 +480,7 @@ struct PlaneState<B> {
 }
 
 impl<B> Default for PlaneState<B> {
+    #[inline]
     fn default() -> Self {
         Self {
             skip: true,
@@ -478,10 +492,12 @@ impl<B> Default for PlaneState<B> {
 }
 
 impl<B> PlaneState<B> {
+    #[inline]
     fn buffer(&self) -> Option<&B> {
         self.config.as_ref().map(|config| &*config.buffer)
     }
 
+    #[inline]
     fn is_compatible(&self, other: &Self) -> bool {
         match (self.config.as_ref(), other.config.as_ref()) {
             (Some(a), Some(b)) => a.is_compatible(b),
@@ -492,6 +508,7 @@ impl<B> PlaneState<B> {
 }
 
 impl<B> Clone for PlaneState<B> {
+    #[inline]
     fn clone(&self) -> Self {
         Self {
             skip: self.skip,
@@ -504,21 +521,30 @@ impl<B> Clone for PlaneState<B> {
 
 #[derive(Debug)]
 struct FrameState<B: AsRef<framebuffer::Handle>> {
-    planes: HashMap<plane::Handle, PlaneState<B>>,
+    planes: SmallVec<[(plane::Handle, PlaneState<B>); 10]>,
 }
 
 impl<B: AsRef<framebuffer::Handle>> FrameState<B> {
+    #[inline]
     fn is_assigned(&self, handle: plane::Handle) -> bool {
         self.planes
-            .get(&handle)
-            .map(|config| config.config.is_some())
+            .iter()
+            .find_map(|(p, state)| {
+                if *p == handle {
+                    Some(state.config.is_some())
+                } else {
+                    None
+                }
+            })
             .unwrap_or(false)
     }
 
+    #[inline]
     fn overlaps(&self, handle: plane::Handle, element_geometry: Rectangle<i32, Physical>) -> bool {
         self.planes
-            .get(&handle)
-            .and_then(|state| {
+            .iter()
+            .find(|(p, _)| *p == handle)
+            .and_then(|(_, state)| {
                 state
                     .config
                     .as_ref()
@@ -527,20 +553,28 @@ impl<B: AsRef<framebuffer::Handle>> FrameState<B> {
             .unwrap_or(false)
     }
 
+    #[inline]
     fn plane_state(&self, handle: plane::Handle) -> Option<&PlaneState<B>> {
-        self.planes.get(&handle)
+        self.planes
+            .iter()
+            .find_map(|(p, state)| if *p == handle { Some(state) } else { None })
     }
 
+    #[inline]
     fn plane_state_mut(&mut self, handle: plane::Handle) -> Option<&mut PlaneState<B>> {
-        self.planes.get_mut(&handle)
+        self.planes
+            .iter_mut()
+            .find_map(|(p, state)| if *p == handle { Some(state) } else { None })
     }
 
+    #[inline]
     fn plane_properties(&self, handle: plane::Handle) -> Option<&PlaneProperties> {
         self.plane_state(handle)
             .and_then(|state| state.config.as_ref())
             .map(|config| &config.properties)
     }
 
+    #[inline]
     fn plane_buffer(&self, handle: plane::Handle) -> Option<&B> {
         self.plane_state(handle)
             .and_then(|state| state.config.as_ref().map(|config| &*config.buffer))
@@ -553,12 +587,14 @@ struct Owned<B>(Rc<B>);
 impl<B> std::ops::Deref for Owned<B> {
     type Target = B;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<B> From<B> for Owned<B> {
+    #[inline]
     fn from(outer: B) -> Self {
         Self(Rc::new(outer))
     }
@@ -568,6 +604,7 @@ impl<B> AsRef<framebuffer::Handle> for Owned<B>
 where
     B: Framebuffer,
 {
+    #[inline]
     fn as_ref(&self) -> &framebuffer::Handle {
         (*self.0).as_ref()
     }
@@ -577,12 +614,14 @@ impl<B> Framebuffer for Owned<B>
 where
     B: Framebuffer,
 {
+    #[inline]
     fn format(&self) -> drm_fourcc::DrmFormat {
         (*self.0).format()
     }
 }
 
 impl<B> Clone for Owned<B> {
+    #[inline]
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
@@ -591,11 +630,10 @@ impl<B> Clone for Owned<B> {
 impl<B: Framebuffer> FrameState<B> {
     fn from_planes(planes: &Planes) -> Self {
         let cursor_plane_count = usize::from(planes.cursor.is_some());
-        // FIXME: We can cache that somewhere and get rid of this allocation in the hot path
-        let mut tmp = HashMap::with_capacity(planes.overlay.len() + cursor_plane_count + 1);
-        tmp.insert(planes.primary.handle, PlaneState::default());
+        let mut tmp = SmallVec::with_capacity(planes.overlay.len() + cursor_plane_count + 1);
+        tmp.push((planes.primary.handle, PlaneState::default()));
         if let Some(info) = planes.cursor.as_ref() {
-            tmp.insert(info.handle, PlaneState::default());
+            tmp.push((info.handle, PlaneState::default()));
         }
         tmp.extend(
             planes
@@ -610,8 +648,9 @@ impl<B: Framebuffer> FrameState<B> {
 
 impl<B: Framebuffer> FrameState<B> {
     #[profiling::function]
+    #[inline]
     fn set_state(&mut self, plane: plane::Handle, state: PlaneState<B>) {
-        let current_config = match self.planes.get_mut(&plane) {
+        let current_config = match self.plane_state_mut(plane) {
             Some(config) => config,
             None => return,
         };
@@ -627,7 +666,7 @@ impl<B: Framebuffer> FrameState<B> {
         state: PlaneState<B>,
         allow_modeset: bool,
     ) -> Result<(), DrmError> {
-        let current_config = match self.planes.get_mut(&plane) {
+        let current_config = match self.plane_state_mut(plane) {
             Some(config) => config,
             None => return Ok(()),
         };
@@ -638,7 +677,7 @@ impl<B: Framebuffer> FrameState<B> {
 
         if res.is_err() {
             // test failed, restore previous state
-            self.planes.insert(plane, backup);
+            *self.plane_state_mut(plane).unwrap() = backup;
         } else {
             self.planes
                 .iter_mut()
@@ -747,7 +786,7 @@ impl<B: Framebuffer> FrameState<B> {
                 if allow_partial_update {
                     !state.skip
                 } else {
-                    state.config.is_some() || surface.claim_plane(**handle).is_some()
+                    state.config.is_some() || surface.claim_plane(*handle).is_some()
                 }
             })
             .map(move |(handle, state)| super::surface::PlaneState {
@@ -778,7 +817,8 @@ pub enum ExportBuffer<'a, B: Buffer> {
 }
 
 impl<'a, B: Buffer> ExportBuffer<'a, B> {
-    fn from_underlying_storage(storage: &'a UnderlyingStorage) -> Option<Self> {
+    #[inline]
+    fn from_underlying_storage(storage: &'a UnderlyingStorage<'_>) -> Option<Self> {
         match storage {
             UnderlyingStorage::Wayland(buffer) => Some(Self::Wayland(buffer)),
             UnderlyingStorage::Memory { .. } => None,
@@ -804,6 +844,9 @@ where
         buffer: ExportBuffer<'_, B>,
         use_opaque: bool,
     ) -> Result<Option<Self::Framebuffer>, Self::Error>;
+
+    /// Test if the provided buffer is eligible for adding a framebuffer
+    fn can_add_framebuffer(&self, buffer: &ExportBuffer<'_, B>) -> bool;
 }
 
 impl<F, B> ExportFramebuffer<B> for Arc<Mutex<F>>
@@ -814,6 +857,7 @@ where
     type Framebuffer = <F as ExportFramebuffer<B>>::Framebuffer;
     type Error = <F as ExportFramebuffer<B>>::Error;
 
+    #[inline]
     fn add_framebuffer(
         &self,
         drm: &DrmDeviceFd,
@@ -822,6 +866,12 @@ where
     ) -> Result<Option<Self::Framebuffer>, Self::Error> {
         let guard = self.lock().unwrap();
         guard.add_framebuffer(drm, buffer, use_opaque)
+    }
+
+    #[inline]
+    fn can_add_framebuffer(&self, buffer: &ExportBuffer<'_, B>) -> bool {
+        let guard = self.lock().unwrap();
+        guard.can_add_framebuffer(buffer)
     }
 }
 
@@ -833,6 +883,7 @@ where
     type Framebuffer = <F as ExportFramebuffer<B>>::Framebuffer;
     type Error = <F as ExportFramebuffer<B>>::Error;
 
+    #[inline]
     fn add_framebuffer(
         &self,
         drm: &DrmDeviceFd,
@@ -840,6 +891,11 @@ where
         use_opaque: bool,
     ) -> Result<Option<Self::Framebuffer>, Self::Error> {
         self.borrow().add_framebuffer(drm, buffer, use_opaque)
+    }
+
+    #[inline]
+    fn can_add_framebuffer(&self, buffer: &ExportBuffer<'_, B>) -> bool {
+        self.borrow().can_add_framebuffer(buffer)
     }
 }
 
@@ -880,6 +936,7 @@ pub struct PrimarySwapchainElement<B: Buffer, F: Framebuffer> {
 
 impl<B: Buffer, F: Framebuffer> PrimarySwapchainElement<B, F> {
     /// Access the underlying swapchain buffer
+    #[inline]
     pub fn buffer(&self) -> &B {
         match &self.slot.0.buffer {
             ScanoutBuffer::Swapchain(slot) => slot,
@@ -985,8 +1042,8 @@ impl<'a, 'b, B: Buffer> Element for SwapchainElement<'a, 'b, B> {
             .unwrap_or_else(|| DamageSet::from_slice(&[self.geometry(scale)]))
     }
 
-    fn opaque_regions(&self, scale: Scale<f64>) -> Vec<Rectangle<i32, Physical>> {
-        vec![self.geometry(scale)]
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        OpaqueRegions::from_slice(&[self.geometry(scale)])
     }
 }
 
@@ -1049,7 +1106,7 @@ where
         }
     }
 
-    fn opaque_regions(&self, scale: Scale<f64>) -> Vec<Rectangle<i32, Physical>> {
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         match self {
             FrameResultDamageElement::Element(e) => e.opaque_regions(scale),
             FrameResultDamageElement::Swapchain(e) => e.opaque_regions(scale),
@@ -1267,7 +1324,7 @@ where
                 trace!("drawing frame element with damage: {:#?}", element_damage);
 
                 element
-                    .draw(&mut frame, src, dst, &element_damage)
+                    .draw(&mut frame, src, dst, &element_damage, &[])
                     .map_err(BlitFrameResultError::Rendering)?;
             }
 
@@ -1313,6 +1370,7 @@ enum ExportBufferError {
 }
 
 impl From<ExportBufferError> for Option<RenderingReason> {
+    #[inline]
     fn from(err: ExportBufferError) -> Self {
         if matches!(err, ExportBufferError::ExportFailed) {
             // Export failed could mean the buffer could
@@ -1333,8 +1391,7 @@ impl From<ExportBufferError> for Option<RenderingReason> {
 
 #[derive(Debug)]
 struct OverlayPlaneElementIds {
-    plane_plane_ids: IndexMap<plane::Handle, Id>,
-    plane_id_element_ids: IndexMap<Id, Id>,
+    plane_ids: Vec<(plane::Handle, Id, Id)>,
 }
 
 impl OverlayPlaneElementIds {
@@ -1342,42 +1399,37 @@ impl OverlayPlaneElementIds {
         let overlay_plane_count = planes.overlay.len();
 
         Self {
-            plane_plane_ids: IndexMap::with_capacity(overlay_plane_count),
-            plane_id_element_ids: IndexMap::with_capacity(overlay_plane_count),
+            plane_ids: Vec::with_capacity(overlay_plane_count),
         }
     }
 
     fn plane_id_for_element_id(&mut self, plane: &plane::Handle, element_id: &Id) -> Id {
         // Either get the existing plane id for the plane when the stored element id
         // matches or generate a new Id (and update the element id)
-        self.plane_plane_ids
-            .entry(*plane)
-            .and_modify(|plane_id| {
-                let current_element_id = self.plane_id_element_ids.get(plane_id).unwrap();
+        let existing = self.plane_ids.iter_mut().find(|(p, _, _)| p == plane);
+        if let Some((_, plane_id, current_element_id)) = existing {
+            if current_element_id != element_id {
+                *plane_id = Id::new();
+                *current_element_id = element_id.clone();
+            }
 
-                if current_element_id != element_id {
-                    *plane_id = Id::new();
-                    self.plane_id_element_ids
-                        .insert(plane_id.clone(), element_id.clone());
-                }
-            })
-            .or_insert_with(|| {
-                let plane_id = Id::new();
-                self.plane_id_element_ids
-                    .insert(plane_id.clone(), element_id.clone());
-                plane_id
-            })
-            .clone()
+            plane_id.clone()
+        } else {
+            let plane_id = Id::new();
+
+            self.plane_ids
+                .push((*plane, plane_id.clone(), element_id.clone()));
+
+            plane_id
+        }
     }
 
     fn contains_plane_id(&self, plane_id: &Id) -> bool {
-        self.plane_id_element_ids.contains_key(plane_id)
+        self.plane_ids.iter().any(|(_, p, _)| p == plane_id)
     }
 
     fn remove_plane(&mut self, plane: &plane::Handle) {
-        if let Some(plane_id) = self.plane_plane_ids.swap_remove(plane) {
-            self.plane_id_element_ids.swap_remove(&plane_id);
-        }
+        self.plane_ids.retain(|(p, _, _)| p != plane);
     }
 }
 
@@ -1387,6 +1439,7 @@ struct PlaneAssignment {
 }
 
 impl From<&PlaneInfo> for PlaneAssignment {
+    #[inline]
     fn from(value: &PlaneInfo) -> Self {
         PlaneAssignment {
             handle: value.handle,
@@ -1449,6 +1502,7 @@ struct PreparedFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer
 }
 
 impl<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>> PreparedFrame<A, F> {
+    #[inline]
     fn is_empty(&self) -> bool {
         // It can happen that we have no changes, but there is a pending commit or
         // we are forced to do a full update in which case we just set the previous state again
@@ -1511,6 +1565,7 @@ where
     previous_element_states:
         IndexMap<Id, ElementState<DrmFramebuffer<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>>,
     opaque_regions: Vec<Rectangle<i32, Physical>>,
+    element_opaque_regions_workhouse: Vec<Rectangle<i32, Physical>>,
 
     debug_flags: DebugFlags,
     span: tracing::Span,
@@ -1585,6 +1640,22 @@ where
             .overlay
             .sort_by_key(|p| std::cmp::Reverse(p.zpos.unwrap_or_default()));
 
+        let driver = surface.get_driver().map_err(|err| {
+            FrameError::DrmError(DrmError::Access(AccessError {
+                errmsg: "Failed to query drm driver",
+                dev: surface.dev_path(),
+                source: err,
+            }))
+        })?;
+        // `IN_FENCE_FD` makes commit fail on Nvidia driver
+        // https://github.com/NVIDIA/open-gpu-kernel-modules/issues/622
+        let is_nvidia = driver.name().to_string_lossy().to_lowercase().contains("nvidia")
+            || driver
+                .description()
+                .to_string_lossy()
+                .to_lowercase()
+                .contains("nvidia");
+
         let cursor_size = Size::from((cursor_size.w as i32, cursor_size.h as i32));
         let damage_tracker = OutputDamageTracker::from_mode_source(output_mode_source.clone());
         let supports_fencing = !surface.is_legacy()
@@ -1598,7 +1669,8 @@ where
                         source: err,
                     }))
                 })?
-            && plane_has_property(&*surface, surface.plane(), "IN_FENCE_FD")?;
+            && plane_has_property(&*surface, surface.plane(), "IN_FENCE_FD")?
+            && !is_nvidia;
 
         for format in color_formats {
             debug!("Testing color format: {}", format);
@@ -1622,10 +1694,8 @@ where
                             }
                         };
 
-                        let cursor_allocator = GbmAllocator::new(
-                            gbm.clone(),
-                            BufferObjectFlags::CURSOR | BufferObjectFlags::WRITE,
-                        );
+                        let cursor_allocator =
+                            GbmAllocator::new(gbm.clone(), GbmBufferFlags::CURSOR | GbmBufferFlags::WRITE);
                         CursorState {
                             allocator: cursor_allocator,
                             framebuffer_exporter: gbm,
@@ -1660,6 +1730,7 @@ where
                         element_states: IndexMap::new(),
                         previous_element_states: IndexMap::new(),
                         opaque_regions: Vec::new(),
+                        element_opaque_regions_workhouse: Vec::new(),
                         supports_fencing,
                         debug_flags: DebugFlags::empty(),
                         span,
@@ -2019,6 +2090,7 @@ where
         let mut output_elements: Vec<(&'a E, Rectangle<i32, Physical>, usize, bool)> =
             Vec::with_capacity(elements.len());
 
+        let mut element_opaque_regions_workhouse = std::mem::take(&mut self.element_opaque_regions_workhouse);
         for element in elements.iter() {
             let element_id = element.id();
             let element_geometry = element.geometry(output_scale);
@@ -2032,10 +2104,14 @@ where
             };
 
             // Then test if the element is completely hidden behind opaque regions
-            // FIXME: This should be possible to calculate without allocating
-            let element_visible_area = element_output_geometry
-                .subtract_rects(opaque_regions.iter().copied())
-                .into_iter()
+            element_opaque_regions_workhouse.clear();
+            element_opaque_regions_workhouse.push(element_output_geometry);
+            element_opaque_regions_workhouse = Rectangle::subtract_rects_many_in_place(
+                element_opaque_regions_workhouse,
+                opaque_regions.iter().copied(),
+            );
+            let element_visible_area = element_opaque_regions_workhouse
+                .iter()
                 .fold(0usize, |acc, item| acc + (item.size.w * item.size.h) as usize);
 
             if element_visible_area == 0 {
@@ -2053,10 +2129,13 @@ where
             }
 
             let element_opaque_regions = element.opaque_regions(output_scale);
-            // FIXME: This should be possible to calculate without allocating
-            let element_is_opaque = Rectangle::from_loc_and_size(Point::default(), element_geometry.size)
-                .subtract_rects(element_opaque_regions.iter().copied())
-                .is_empty();
+            element_opaque_regions_workhouse.clear();
+            element_opaque_regions_workhouse.push(element_output_geometry);
+            element_opaque_regions_workhouse = Rectangle::subtract_rects_many_in_place(
+                element_opaque_regions_workhouse,
+                element_opaque_regions.iter().copied(),
+            );
+            let element_is_opaque = element_opaque_regions_workhouse.is_empty();
 
             opaque_regions.extend(
                 element_opaque_regions
@@ -2070,6 +2149,7 @@ where
 
             output_elements.push((element, element_geometry, element_visible_area, element_is_opaque));
         }
+        self.element_opaque_regions_workhouse = element_opaque_regions_workhouse;
 
         // This will hold the element that has been selected for direct scan-out on
         // the primary plane if any
@@ -2314,15 +2394,24 @@ where
             // commit -> unlikely but possible
             // So we use an Id per plane for as long as we have the same element
             // on that plane.
-            let overlay_plane_lookup: HashMap<plane::Handle, &PlaneInfo> =
-                self.planes.overlay.iter().map(|p| (p.handle, p)).collect();
             let overlay_plane_elements = overlay_plane_elements.iter().filter_map(|(p, element)| {
                 let id = self
                     .overlay_plane_element_ids
                     .plane_id_for_element_id(p, element.id());
 
-                let is_underlay = overlay_plane_lookup.get(p).unwrap().zpos.unwrap_or_default()
-                    < self.planes.primary.zpos.unwrap_or_default();
+                let plane_z_pos = self
+                    .planes
+                    .overlay
+                    .iter()
+                    .find_map(|info| {
+                        if info.handle == *p {
+                            Some(info.zpos.unwrap_or_default())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                let is_underlay = plane_z_pos < self.planes.primary.zpos.unwrap_or_default();
                 if is_underlay {
                     Some(HolepunchRenderElement::from_render_element(id, element, output_scale).into())
                 } else {
@@ -2788,25 +2877,7 @@ where
         E: RenderElement<R>,
     {
         // Check if we have a free plane, otherwise we can exit early
-        if !self.direct_scanout
-            || ((self.planes.overlay.is_empty()
-                || self
-                    .planes
-                    .overlay
-                    .iter()
-                    .all(|plane| frame_state.is_assigned(plane.handle)))
-                && self
-                    .planes
-                    .cursor
-                    .as_ref()
-                    .map(|plane| frame_state.is_assigned(plane.handle))
-                    .unwrap_or(true)
-                && (!try_assign_primary_plane
-                    || frame_state
-                        .plane_state(self.planes.primary.handle)
-                        .map(|state| state.element_state.is_some())
-                        .unwrap_or(true)))
-        {
+        if !self.direct_scanout {
             trace!(
                 "skipping direct scan-out for element {:?}, no free planes",
                 element.id()
@@ -2903,6 +2974,14 @@ where
         R: Renderer,
         E: RenderElement<R>,
     {
+        if frame_state
+            .plane_state(self.planes.primary.handle)
+            .map(|state| state.element_state.is_some())
+            .unwrap_or(true)
+        {
+            return Err(None);
+        }
+
         let element_config = self.element_config(
             renderer,
             element,
@@ -3030,8 +3109,7 @@ where
                 .unwrap_or(true)
             || previous_element_state
                 .map(|element_state| {
-                    element_state.id != *element.id()
-                        || !element.damage_since(scale, Some(element_state.commit)).is_empty()
+                    element_state.id != *element.id() || element.current_commit() != element_state.commit
                 })
                 .unwrap_or(true);
 
@@ -3166,7 +3244,7 @@ where
             // client, or the compositor's choice.
             let cursor_texture = match storage {
                 UnderlyingStorage::Wayland(buffer) => pixman_renderer
-                    .import_buffer(&buffer, None, &[element.src().to_i32_up()])
+                    .import_buffer(buffer, None, &[element.src().to_i32_up()])
                     .transpose()
                     .ok()
                     .flatten(),
@@ -3230,6 +3308,7 @@ where
                             src,
                             dst,
                             &[dst],
+                            &[],
                             element.transform(),
                             element.alpha(),
                         )?;
@@ -3371,6 +3450,13 @@ where
             .underlying_storage(renderer)
             .ok_or(ExportBufferError::NoUnderlyingStorage)?;
 
+        let export_buffer = ExportBuffer::from_underlying_storage(&underlying_storage)
+            .ok_or(ExportBufferError::Unsupported)?;
+
+        if !self.framebuffer_exporter.can_add_framebuffer(&export_buffer) {
+            return Err(ExportBufferError::Unsupported);
+        }
+
         // First we try to find a state in our new states, this is important if
         // we got the same id multiple times. If we can't find it we use the previous
         // state if available
@@ -3407,19 +3493,16 @@ where
                 &underlying_storage
             );
 
-            let fb = ExportBuffer::from_underlying_storage(&underlying_storage)
-                .ok_or(ExportBufferError::Unsupported)
-                .and_then(|buffer| {
-                    self.framebuffer_exporter
-                        .add_framebuffer(self.surface.device_fd(), buffer, allow_opaque_fallback)
-                        .map_err(|err| {
-                            trace!("failed to add framebuffer: {:?}", err);
-                            ExportBufferError::ExportFailed
-                        })
-                        .and_then(|fb| {
-                            fb.map(|fb| OwnedFramebuffer::new(DrmFramebuffer::Exporter(fb)))
-                                .ok_or(ExportBufferError::Unsupported)
-                        })
+            let fb = self
+                .framebuffer_exporter
+                .add_framebuffer(self.surface.device_fd(), export_buffer, allow_opaque_fallback)
+                .map_err(|err| {
+                    trace!("failed to add framebuffer: {:?}", err);
+                    ExportBufferError::ExportFailed
+                })
+                .and_then(|fb| {
+                    fb.map(|fb| OwnedFramebuffer::new(DrmFramebuffer::Exporter(fb)))
+                        .ok_or(ExportBufferError::Unsupported)
                 });
 
             if fb.is_err() {
@@ -3459,7 +3542,12 @@ where
             format: fb.format(),
         };
         let buffer = ScanoutBuffer::from_underlying_storage(underlying_storage)
-            .map(|buffer| Owned::from(DrmScanoutBuffer { fb, buffer }))
+            .map(|buffer| {
+                Owned::from(DrmScanoutBuffer {
+                    fb: fb.clone(),
+                    buffer,
+                })
+            })
             .ok_or(ExportBufferError::Unsupported)?;
 
         if !element_states
@@ -3603,12 +3691,11 @@ where
         let element_id = element.id();
 
         // Check if we have a free plane, otherwise we can exit early
-        if self.planes.overlay.is_empty()
-            || self
-                .planes
-                .overlay
-                .iter()
-                .all(|plane| frame_state.is_assigned(plane.handle))
+        if self
+            .planes
+            .overlay
+            .iter()
+            .all(|plane| frame_state.is_assigned(plane.handle))
         {
             trace!(
                 "skipping overlay planes for element {:?}, no free planes",
@@ -3830,7 +3917,7 @@ where
             .map(|pending| &pending.frame)
             .unwrap_or(&self.current_frame);
 
-        let previous_commit = previous_state.planes.get(&plane.handle).and_then(|state| {
+        let previous_commit = previous_state.plane_state(plane.handle).and_then(|state| {
             state.element_state.as_ref().and_then(|state| {
                 if state.id == *element_id {
                     Some(state.commit)
@@ -3945,9 +4032,10 @@ where
     }
 }
 
+#[inline]
 fn apply_underlying_storage_transform(
     element_transform: Transform,
-    storage: &UnderlyingStorage,
+    storage: &UnderlyingStorage<'_>,
 ) -> Transform {
     match storage {
         UnderlyingStorage::Wayland(buffer) => {
@@ -3970,6 +4058,7 @@ fn apply_underlying_storage_transform(
     }
 }
 
+#[inline]
 fn apply_output_transform(transform: Transform, output_transform: Transform) -> Transform {
     match (transform, output_transform) {
         (Transform::Normal, output_transform) => output_transform,
@@ -4047,7 +4136,7 @@ fn copy_element_to_cursor_bo<R, E, T>(
     cursor_size: Size<i32, Physical>,
     output_transform: Transform,
     device: &GbmDevice<T>,
-    bo: &mut BufferObject<()>,
+    bo: &mut GbmBuffer,
 ) -> bool
 where
     R: Renderer,
@@ -4071,9 +4160,7 @@ where
         return false;
     }
 
-    let Ok(bo_format) = bo.format() else {
-        return false;
-    };
+    let bo_format = bo.format().code;
     let Ok(bo_stride) = bo.stride() else {
         return false;
     };
@@ -4101,7 +4188,7 @@ where
     match underlying_storage {
         UnderlyingStorage::Wayland(buffer) => {
             // Only shm buffers are supported for copy
-            shm::with_buffer_contents(&buffer, |ptr, len, data| {
+            shm::with_buffer_contents(buffer, |ptr, len, data| {
                 let Some(format) = shm::shm_format_to_fourcc(data.format) else {
                     return false;
                 };
@@ -4128,14 +4215,15 @@ where
                 return false;
             };
 
-            copy_to_bo(&*memory, memory.stride(), memory.size().h)
+            copy_to_bo(memory, memory.stride(), memory.size().h)
         }
     }
 }
 
-struct OwnedFramebuffer<B: Framebuffer>(Arc<B>);
+struct OwnedFramebuffer<B: Framebuffer>(Rc<B>);
 
 impl<B: Framebuffer> PartialEq for OwnedFramebuffer<B> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         AsRef::<framebuffer::Handle>::as_ref(&self) == AsRef::<framebuffer::Handle>::as_ref(&other)
     }
@@ -4148,24 +4236,28 @@ impl<B: Framebuffer + std::fmt::Debug> std::fmt::Debug for OwnedFramebuffer<B> {
 }
 
 impl<B: Framebuffer> OwnedFramebuffer<B> {
+    #[inline]
     fn new(buffer: B) -> Self {
-        OwnedFramebuffer(Arc::new(buffer))
+        OwnedFramebuffer(Rc::new(buffer))
     }
 }
 
 impl<B: Framebuffer> Clone for OwnedFramebuffer<B> {
+    #[inline]
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
 impl<B: Framebuffer> AsRef<framebuffer::Handle> for OwnedFramebuffer<B> {
+    #[inline]
     fn as_ref(&self) -> &framebuffer::Handle {
         (*self.0).as_ref()
     }
 }
 
 impl<B: Framebuffer> Framebuffer for OwnedFramebuffer<B> {
+    #[inline]
     fn format(&self) -> drm_fourcc::DrmFormat {
         (*self.0).format()
     }
@@ -4250,6 +4342,7 @@ impl<
         F: std::error::Error + Send + Sync + 'static,
     > From<FrameError<A, B, F>> for SwapBuffersError
 {
+    #[inline]
     fn from(err: FrameError<A, B, F>) -> SwapBuffersError {
         match err {
             x @ FrameError::NoSupportedPlaneFormat

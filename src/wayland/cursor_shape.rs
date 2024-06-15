@@ -33,7 +33,7 @@
 //! #   fn alive(&self) -> bool { true }
 //! # }
 //! # impl WaylandFocus for Target {
-//! #   fn wl_surface(&self) -> Option<wl_surface::WlSurface> {
+//! #   fn wl_surface(&self) -> Option<std::borrow::Cow<'_, wl_surface::WlSurface>> {
 //! #       None
 //! #   }
 //! # }
@@ -112,7 +112,8 @@ use wayland_server::{backend::GlobalId, Dispatch, DisplayHandle};
 
 use crate::input::pointer::{CursorIcon, CursorImageStatus};
 use crate::input::SeatHandler;
-use crate::wayland::seat::WaylandFocus;
+use crate::utils::Serial;
+use crate::wayland::seat::{pointer::allow_setting_cursor, WaylandFocus};
 
 use super::seat::PointerUserData;
 use super::tablet_manager::{TabletSeatHandler, TabletToolUserData};
@@ -244,24 +245,7 @@ where
                             None => return,
                         };
 
-                        // Ignore mismatches in serial.
-                        if !handle
-                            .last_enter
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .map(|last_serial| last_serial.0 == serial)
-                            .unwrap_or(false)
-                        {
-                            return;
-                        }
-
-                        // Check that pointer focus matches.
-                        if !handle
-                            .current_focus()
-                            .map(|focus| focus.same_client_as(&pointer.id()))
-                            .unwrap_or(false)
-                        {
+                        if !allow_setting_cursor(handle, Serial(serial), &pointer.id()) {
                             return;
                         }
 

@@ -401,8 +401,10 @@ pub struct GlesRenderer {
     // caches
     buffers: Vec<GlesBuffer>,
     dmabuf_cache: std::collections::HashMap<WeakDmabuf, GlesTexture>,
-    vbos: [ffi::types::GLuint; 3],
+    vbos: [ffi::types::GLuint; 2],
     vertices: Vec<f32>,
+    non_opaque_damage: Vec<Rectangle<i32, Physical>>,
+    opaque_damage: Vec<Rectangle<i32, Physical>>,
 
     // cleanup
     destruction_callback: Receiver<CleanupResource>,
@@ -708,7 +710,7 @@ impl GlesRenderer {
             &TRIANGLE_VERTS
         };
 
-        let mut vbos = [0; 3];
+        let mut vbos = [0; 2];
         gl.GenBuffers(vbos.len() as i32, vbos.as_mut_ptr());
         gl.BindBuffer(ffi::ARRAY_BUFFER, vbos[0]);
         gl.BufferData(
@@ -717,7 +719,7 @@ impl GlesRenderer {
             vertices.as_ptr() as *const _,
             ffi::STATIC_DRAW,
         );
-        gl.BindBuffer(ffi::ARRAY_BUFFER, vbos[2]);
+        gl.BindBuffer(ffi::ARRAY_BUFFER, vbos[1]);
         gl.BufferData(
             ffi::ARRAY_BUFFER,
             (std::mem::size_of::<ffi::types::GLfloat>() * OUTPUT_VERTS.len()) as isize,
@@ -752,6 +754,8 @@ impl GlesRenderer {
             buffers: Vec::new(),
             dmabuf_cache: std::collections::HashMap::new(),
             vertices: Vec::with_capacity(6 * 16),
+            non_opaque_damage: Vec::with_capacity(16),
+            opaque_damage: Vec::with_capacity(16),
 
             destruction_callback: rx,
             destruction_callback_sender: tx,
@@ -772,15 +776,13 @@ impl GlesRenderer {
         } else {
             unsafe { self.egl.make_current()? };
         }
-        // delayed destruction until the next frame rendering.
-        self.cleanup();
         Ok(())
     }
 
     #[profiling::function]
     fn cleanup(&mut self) {
         #[cfg(feature = "wayland_frontend")]
-        self.dmabuf_cache.retain(|entry, _tex| entry.upgrade().is_some());
+        self.dmabuf_cache.retain(|entry, _tex| !entry.is_gone());
         // Free outdated buffer resources
         // TODO: Replace with `drain_filter` once it lands
         let mut i = 0;
@@ -1280,25 +1282,19 @@ impl ImportDmaWl for GlesRenderer {}
 impl GlesRenderer {
     #[profiling::function]
     fn existing_dmabuf_texture(&self, buffer: &Dmabuf) -> Result<Option<GlesTexture>, GlesError> {
-        let existing_texture = self
-            .dmabuf_cache
-            .iter()
-            .find(|(weak, _)| weak.upgrade().map(|entry| &entry == buffer).unwrap_or(false))
-            .map(|(_, tex)| tex.clone());
+        let Some(texture) = self.dmabuf_cache.get(&buffer.weak()) else {
+            return Ok(None);
+        };
 
-        if let Some(texture) = existing_texture {
-            trace!("Re-using texture {:?} for {:?}", texture.0.texture, buffer);
-            if let Some(egl_images) = texture.0.egl_images.as_ref() {
-                if egl_images[0] == ffi_egl::NO_IMAGE_KHR {
-                    return Ok(None);
-                }
-                let tex = Some(texture.0.texture);
-                self.import_egl_image(egl_images[0], texture.0.is_external, tex)?;
+        trace!("Re-using texture {:?} for {:?}", texture.0.texture, buffer);
+        if let Some(egl_images) = texture.0.egl_images.as_ref() {
+            if egl_images[0] == ffi_egl::NO_IMAGE_KHR {
+                return Ok(None);
             }
-            Ok(Some(texture))
-        } else {
-            Ok(None)
+            let tex = Some(texture.0.texture);
+            self.import_egl_image(egl_images[0], texture.0.is_external, tex)?;
         }
+        Ok(Some(texture.clone()))
     }
 
     #[profiling::function]
@@ -2537,10 +2533,21 @@ impl<'frame> Frame for GlesFrame<'frame> {
         src: Rectangle<f64, BufferCoord>,
         dest: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
         transform: Transform,
         alpha: f32,
     ) -> Result<(), GlesError> {
-        self.render_texture_from_to(texture, src, dest, damage, transform, alpha, None, &[])
+        self.render_texture_from_to(
+            texture,
+            src,
+            dest,
+            damage,
+            opaque_regions,
+            transform,
+            alpha,
+            None,
+            &[],
+        )
     }
 
     fn transformation(&self) -> Transform {
@@ -2611,7 +2618,7 @@ impl<'frame> GlesFrame<'frame> {
                         .EnableVertexAttribArray(program.attrib_vert as u32);
                     self.renderer
                         .gl
-                        .BindBuffer(ffi::ARRAY_BUFFER, self.renderer.vbos[2]);
+                        .BindBuffer(ffi::ARRAY_BUFFER, self.renderer.vbos[1]);
                     self.renderer.gl.VertexAttribPointer(
                         program.attrib_vert as u32,
                         2,
@@ -2629,6 +2636,9 @@ impl<'frame> GlesFrame<'frame> {
                 }
             }
         }
+
+        // delayed destruction until the next frame rendering.
+        self.renderer.cleanup();
 
         // if we support egl fences we should use it
         if self.renderer.capabilities.contains(&Capability::Fencing) {
@@ -2756,13 +2766,7 @@ impl<'frame> GlesFrame<'frame> {
             );
 
             gl.EnableVertexAttribArray(self.renderer.solid_program.attrib_position as u32);
-            gl.BindBuffer(ffi::ARRAY_BUFFER, self.renderer.vbos[1]);
-            gl.BufferData(
-                ffi::ARRAY_BUFFER,
-                (std::mem::size_of::<ffi::types::GLfloat>() * self.renderer.vertices.len()) as isize,
-                self.renderer.vertices.as_ptr() as *const _,
-                ffi::STREAM_DRAW,
-            );
+            gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
 
             gl.VertexAttribPointer(
                 self.renderer.solid_program.attrib_position as u32,
@@ -2770,7 +2774,7 @@ impl<'frame> GlesFrame<'frame> {
                 ffi::FLOAT,
                 ffi::FALSE,
                 0,
-                std::ptr::null(),
+                self.renderer.vertices.as_ptr() as *const _,
             );
 
             let damage_len = damage.len() as i32;
@@ -2781,28 +2785,10 @@ impl<'frame> GlesFrame<'frame> {
 
                 gl.DrawArraysInstanced(ffi::TRIANGLE_STRIP, 0, 4, damage_len);
             } else {
-                // When we have more than 10 rectangles, draw them in batches of 10.
-                for i in 0..(damage_len - 1) / 10 {
-                    gl.DrawArrays(ffi::TRIANGLES, 0, 60);
-
-                    // Set damage pointer to the next 10 rectangles.
-                    let offset = (i + 1) as usize * 60 * 4 * std::mem::size_of::<ffi::types::GLfloat>();
-                    gl.VertexAttribPointer(
-                        self.renderer.solid_program.attrib_position as u32,
-                        4,
-                        ffi::FLOAT,
-                        ffi::FALSE,
-                        0,
-                        offset as *const _,
-                    );
-                }
-
-                // Draw the up to 10 remaining rectangles.
-                let count = ((damage_len - 1) % 10 + 1) * 6;
+                let count = damage_len * 6;
                 gl.DrawArrays(ffi::TRIANGLES, 0, count);
             }
 
-            gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
             gl.DisableVertexAttribArray(self.renderer.solid_program.attrib_vert as u32);
             gl.DisableVertexAttribArray(self.renderer.solid_program.attrib_position as u32);
         }
@@ -2824,6 +2810,7 @@ impl<'frame> GlesFrame<'frame> {
         src: Rectangle<f64, BufferCoord>,
         dest: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
         transform: Transform,
         alpha: f32,
         program: Option<&GlesTexProgram>,
@@ -2847,34 +2834,99 @@ impl<'frame> GlesFrame<'frame> {
             tex_mat = Matrix3::new(1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0) * tex_mat;
         }
 
-        let instances = damage.iter().flat_map(|rect| {
-            let dest_size = dest.size;
+        let render_texture = |renderer: &mut Self, damage: &[Rectangle<i32, Physical>]| {
+            let instances = damage.iter().flat_map(|rect| {
+                let dest_size = dest.size;
 
-            let rect_constrained_loc = rect
-                .loc
-                .constrain(Rectangle::from_extemities((0, 0), dest_size.to_point()));
-            let rect_clamped_size = rect
-                .size
-                .clamp((0, 0), (dest_size.to_point() - rect_constrained_loc).to_size());
+                let rect_constrained_loc = rect
+                    .loc
+                    .constrain(Rectangle::from_extemities((0, 0), dest_size.to_point()));
+                let rect_clamped_size = rect
+                    .size
+                    .clamp((0, 0), (dest_size.to_point() - rect_constrained_loc).to_size());
 
-            let rect = Rectangle::from_loc_and_size(rect_constrained_loc, rect_clamped_size);
-            [
-                rect.loc.x as f32,
-                rect.loc.y as f32,
-                rect.size.w as f32,
-                rect.size.h as f32,
-            ]
-        });
+                let rect = Rectangle::from_loc_and_size(rect_constrained_loc, rect_clamped_size);
+                [
+                    rect.loc.x as f32,
+                    rect.loc.y as f32,
+                    rect.size.w as f32,
+                    rect.size.h as f32,
+                ]
+            });
 
-        self.render_texture(
-            texture,
-            tex_mat,
-            mat,
-            Some(instances),
-            alpha,
-            program,
-            additional_uniforms,
-        )
+            renderer.render_texture(
+                texture,
+                tex_mat,
+                mat,
+                Some(instances),
+                alpha,
+                program,
+                additional_uniforms,
+            )
+        };
+
+        // We split the damage in opaque and non opaque regions, for opaque regions we can
+        // disable blending. Most likely we did not clear regions marked as opaque, which can
+        // result in read-back when not disabling blending. This can be problematic on tile based
+        // renderers.
+        let mut non_opaque_damage = std::mem::take(&mut self.renderer.non_opaque_damage);
+        let mut opaque_damage = std::mem::take(&mut self.renderer.opaque_damage);
+        non_opaque_damage.clear();
+        opaque_damage.clear();
+
+        // If drawing is implicit opaque we can skip some logic and save
+        // a few operations. In case we have some user-provided alpha we
+        // can not disable blending, but should also have cleared the region
+        // previously anyway. In case we have no opaque regions we can also
+        // short cut the logic a bit.
+        let is_implicit_opaque = !texture.0.has_alpha && alpha == 1f32;
+        if is_implicit_opaque {
+            opaque_damage.extend_from_slice(damage);
+        } else if alpha != 1f32 || opaque_regions.is_empty() {
+            non_opaque_damage.extend_from_slice(damage);
+        } else {
+            non_opaque_damage.extend_from_slice(damage);
+            opaque_damage.extend_from_slice(damage);
+
+            non_opaque_damage =
+                Rectangle::subtract_rects_many_in_place(non_opaque_damage, opaque_regions.iter().copied());
+            opaque_damage =
+                Rectangle::subtract_rects_many_in_place(opaque_damage, non_opaque_damage.iter().copied());
+        }
+
+        tracing::trace!(non_opaque_damage = ?non_opaque_damage, opaque_damage = ?opaque_damage, "drawing texture");
+
+        let non_opaque_render_res = if !non_opaque_damage.is_empty() {
+            render_texture(self, &non_opaque_damage)
+        } else {
+            Ok(())
+        };
+
+        let opaque_render_res = if !opaque_damage.is_empty() {
+            unsafe {
+                self.renderer.gl.Disable(ffi::BLEND);
+            }
+
+            let res = render_texture(self, &opaque_damage);
+
+            unsafe {
+                self.renderer.gl.Enable(ffi::BLEND);
+                self.renderer.gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
+            }
+
+            res
+        } else {
+            Ok(())
+        };
+
+        // Return the damage(s) to be able to re-use the allocation(s)
+        std::mem::swap(&mut self.renderer.non_opaque_damage, &mut non_opaque_damage);
+        std::mem::swap(&mut self.renderer.opaque_damage, &mut opaque_damage);
+
+        non_opaque_render_res?;
+        opaque_render_res?;
+
+        Ok(())
     }
 
     /// Render a texture to the current target using given projection matrix and alpha.
@@ -3023,13 +3075,7 @@ impl<'frame> GlesFrame<'frame> {
 
             // vert_position
             gl.EnableVertexAttribArray(program.attrib_vert_position as u32);
-            gl.BindBuffer(ffi::ARRAY_BUFFER, self.renderer.vbos[1]);
-            gl.BufferData(
-                ffi::ARRAY_BUFFER,
-                (std::mem::size_of::<ffi::types::GLfloat>() * self.renderer.vertices.len()) as isize,
-                self.renderer.vertices.as_ptr() as *const _,
-                ffi::STREAM_DRAW,
-            );
+            gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
 
             gl.VertexAttribPointer(
                 program.attrib_vert_position as u32,
@@ -3037,7 +3083,7 @@ impl<'frame> GlesFrame<'frame> {
                 ffi::FLOAT,
                 ffi::FALSE,
                 0,
-                std::ptr::null(),
+                self.renderer.vertices.as_ptr() as *const _,
             );
 
             if self.renderer.capabilities.contains(&Capability::Instancing) {
@@ -3046,28 +3092,10 @@ impl<'frame> GlesFrame<'frame> {
 
                 gl.DrawArraysInstanced(ffi::TRIANGLE_STRIP, 0, 4, damage_len as i32);
             } else {
-                // When we have more than 10 rectangles, draw them in batches of 10.
-                for i in 0..(damage_len - 1) / 10 {
-                    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-
-                    // Set damage pointer to the next 10 rectangles.
-                    let offset = (i + 1) * 6 * 4 * std::mem::size_of::<ffi::types::GLfloat>();
-                    gl.VertexAttribPointer(
-                        program.attrib_vert_position as u32,
-                        4,
-                        ffi::FLOAT,
-                        ffi::FALSE,
-                        0,
-                        offset as *const _,
-                    );
-                }
-
-                // Draw the up to 10 remaining rectangles.
-                let count = ((damage_len - 1) % 10 + 1) * 6;
+                let count = damage_len * 6;
                 gl.DrawArrays(ffi::TRIANGLES, 0, count as i32);
             }
 
-            gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
             gl.BindTexture(target, 0);
             gl.DisableVertexAttribArray(program.attrib_vert as u32);
             gl.DisableVertexAttribArray(program.attrib_vert_position as u32);
@@ -3198,13 +3226,7 @@ impl<'frame> GlesFrame<'frame> {
 
             // vert_position
             gl.EnableVertexAttribArray(program.attrib_position as u32);
-            gl.BindBuffer(ffi::ARRAY_BUFFER, self.renderer.vbos[1]);
-            gl.BufferData(
-                ffi::ARRAY_BUFFER,
-                (std::mem::size_of::<ffi::types::GLfloat>() * self.renderer.vertices.len()) as isize,
-                self.renderer.vertices.as_ptr() as *const _,
-                ffi::STREAM_DRAW,
-            );
+            gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
 
             gl.VertexAttribPointer(
                 program.attrib_position as u32,
@@ -3212,7 +3234,7 @@ impl<'frame> GlesFrame<'frame> {
                 ffi::FLOAT,
                 ffi::FALSE,
                 0,
-                std::ptr::null(),
+                self.renderer.vertices.as_ptr() as *const _,
             );
 
             let damage_len = damage.len() as i32;
@@ -3222,28 +3244,10 @@ impl<'frame> GlesFrame<'frame> {
 
                 gl.DrawArraysInstanced(ffi::TRIANGLE_STRIP, 0, 4, damage_len);
             } else {
-                // When we have more than 10 rectangles, draw them in batches of 10.
-                for i in 0..(damage_len - 1) / 10 {
-                    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-
-                    // Set damage pointer to the next 10 rectangles.
-                    let offset = (i + 1) as usize * 6 * 4 * std::mem::size_of::<ffi::types::GLfloat>();
-                    gl.VertexAttribPointer(
-                        program.attrib_position as u32,
-                        4,
-                        ffi::FLOAT,
-                        ffi::FALSE,
-                        0,
-                        offset as *const _,
-                    );
-                }
-
-                // Draw the up to 10 remaining rectangles.
-                let count = ((damage_len - 1) % 10 + 1) * 6;
+                let count = damage_len * 6;
                 gl.DrawArrays(ffi::TRIANGLES, 0, count);
             }
 
-            gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
             gl.DisableVertexAttribArray(program.attrib_vert as u32);
             gl.DisableVertexAttribArray(program.attrib_position as u32);
         }
@@ -3265,6 +3269,16 @@ impl<'frame> GlesFrame<'frame> {
     /// the renderer's behaviour, check the source.
     pub fn egl_context(&self) -> &EGLContext {
         self.renderer.egl_context()
+    }
+
+    /// Returns the supported [`Capabilities`](Capability) of the underlying renderer.
+    pub fn capabilities(&self) -> &[Capability] {
+        self.renderer.capabilities()
+    }
+
+    /// Returns the current enabled [`DebugFlags`] of the underlying renderer.
+    pub fn debug_flags(&self) -> DebugFlags {
+        self.renderer.debug_flags()
     }
 }
 

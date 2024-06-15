@@ -68,7 +68,10 @@ impl PopupManager {
         <D as SeatHandler>::PointerFocus: From<<D as SeatHandler>::KeyboardFocus> + WaylandFocus,
     {
         let surface = popup.wl_surface();
-        assert_eq!(root.wl_surface(), Some(find_popup_root_surface(&popup)?));
+        assert_eq!(
+            root.wl_surface().as_deref(),
+            Some(&find_popup_root_surface(&popup)?)
+        );
 
         match popup {
             PopupKind::Xdg(ref xdg) => {
@@ -327,6 +330,7 @@ impl PopupTree {
         children.retain(|n| n.surface.alive());
     }
 
+    #[inline]
     fn alive(&self) -> bool {
         !self.0.lock().unwrap().is_empty()
     }
