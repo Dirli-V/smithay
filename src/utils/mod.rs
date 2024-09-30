@@ -15,9 +15,11 @@ pub use self::alive_tracker::IsAlive;
 mod fd;
 pub use fd::*;
 
-#[cfg(feature = "wayland_frontend")]
-pub(crate) mod sealed_file;
+mod sealed_file;
+pub use sealed_file::SealedFile;
 
+#[cfg(feature = "wayland_frontend")]
+pub(crate) use self::geometry::Client;
 pub use self::geometry::{
     Buffer, Coordinate, Logical, Physical, Point, Raw, Rectangle, Scale, Size, Transform,
 };
@@ -27,6 +29,11 @@ pub use serial::*;
 
 mod clock;
 pub use clock::*;
+
+#[cfg(feature = "wayland_frontend")]
+pub(crate) mod hook;
+#[cfg(feature = "wayland_frontend")]
+pub use hook::HookId;
 
 /// This resource is not managed by Smithay
 #[derive(Debug)]

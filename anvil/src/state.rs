@@ -29,7 +29,7 @@ use smithay::{
     },
     input::{
         keyboard::{Keysym, LedState, XkbConfig},
-        pointer::{CursorImageStatus, PointerHandle},
+        pointer::{CursorImageStatus, CursorImageSurfaceData, PointerHandle},
         Seat, SeatHandler, SeatState,
     },
     output::Output,
@@ -44,7 +44,7 @@ use smithay::{
             Display, DisplayHandle, Resource,
         },
     },
-    utils::{Clock, Monotonic, Rectangle},
+    utils::{Clock, Logical, Monotonic, Point, Rectangle},
     wayland::{
         compositor::{get_parent, with_states, CompositorClientState, CompositorState},
         dmabuf::DmabufFeedback,
@@ -75,10 +75,11 @@ use smithay::{
             wlr_layer::WlrLayerShellState,
             xdg::{
                 decoration::{XdgDecorationHandler, XdgDecorationState},
-                ToplevelSurface, XdgShellState, XdgToplevelSurfaceData,
+                ToplevelSurface, XdgShellState,
             },
         },
         shm::{ShmHandler, ShmState},
+        single_pixel_buffer::SinglePixelBufferState,
         socket::ListeningSocketSource,
         tablet_manager::{TabletManagerState, TabletSeatHandler},
         text_input::TextInputManagerState,
@@ -100,7 +101,7 @@ use crate::{
 #[cfg(feature = "xwayland")]
 use smithay::{
     delegate_xwayland_keyboard_grab, delegate_xwayland_shell,
-    utils::{Point, Size},
+    utils::Size,
     wayland::selection::{SelectionSource, SelectionTarget},
     wayland::xwayland_keyboard_grab::{XWaylandKeyboardGrabHandler, XWaylandKeyboardGrabState},
     wayland::xwayland_shell,
@@ -150,8 +151,9 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub xdg_foreign_state: XdgForeignState,
     #[cfg(feature = "xwayland")]
     pub xwayland_shell_state: xwayland_shell::XWaylandShellState,
+    pub single_pixel_buffer_state: SinglePixelBufferState,
 
-    pub dnd_icon: Option<WlSurface>,
+    pub dnd_icon: Option<DndIcon>,
 
     // input-related fields
     pub suppressed_keys: Vec<Keysym>,
@@ -172,6 +174,12 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub show_window_preview: bool,
 }
 
+#[derive(Debug)]
+pub struct DndIcon {
+    pub surface: WlSurface,
+    pub offset: Point<i32, Logical>,
+}
+
 delegate_compositor!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
 impl<BackendData: Backend> DataDeviceHandler for AnvilState<BackendData> {
@@ -182,7 +190,21 @@ impl<BackendData: Backend> DataDeviceHandler for AnvilState<BackendData> {
 
 impl<BackendData: Backend> ClientDndGrabHandler for AnvilState<BackendData> {
     fn started(&mut self, _source: Option<WlDataSource>, icon: Option<WlSurface>, _seat: Seat<Self>) {
-        self.dnd_icon = icon;
+        let offset = if let CursorImageStatus::Surface(ref surface) = self.cursor_status {
+            with_states(surface, |states| {
+                let hotspot = states
+                    .data_map
+                    .get::<CursorImageSurfaceData>()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .hotspot;
+                Point::from((-hotspot.x, -hotspot.y))
+            })
+        } else {
+            (0, 0).into()
+        };
+        self.dnd_icon = icon.map(|surface| DndIcon { surface, offset });
     }
     fn dropped(&mut self, _seat: Seat<Self>) {
         self.dnd_icon = None;
@@ -343,6 +365,29 @@ impl<BackendData: Backend> PointerConstraintsHandler for AnvilState<BackendData>
             });
         }
     }
+
+    fn cursor_position_hint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        location: Point<f64, Logical>,
+    ) {
+        if with_pointer_constraint(surface, pointer, |constraint| {
+            constraint.map_or(false, |c| c.is_active())
+        }) {
+            let origin = self
+                .space
+                .elements()
+                .find_map(|window| {
+                    (window.wl_surface().as_deref() == Some(surface)).then(|| window.geometry())
+                })
+                .unwrap_or_default()
+                .loc
+                .to_f64();
+
+            pointer.set_location(origin + location);
+        }
+    }
 }
 delegate_pointer_constraints!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
@@ -405,16 +450,7 @@ impl<BackendData: Backend> XdgDecorationHandler for AnvilState<BackendData> {
             });
         });
 
-        let initial_configure_sent = with_states(toplevel.wl_surface(), |states| {
-            states
-                .data_map
-                .get::<XdgToplevelSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .initial_configure_sent
-        });
-        if initial_configure_sent {
+        if toplevel.is_initial_configure_sent() {
             toplevel.send_pending_configure();
         }
     }
@@ -423,16 +459,8 @@ impl<BackendData: Backend> XdgDecorationHandler for AnvilState<BackendData> {
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(Mode::ClientSide);
         });
-        let initial_configure_sent = with_states(toplevel.wl_surface(), |states| {
-            states
-                .data_map
-                .get::<XdgToplevelSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .initial_configure_sent
-        });
-        if initial_configure_sent {
+
+        if toplevel.is_initial_configure_sent() {
             toplevel.send_pending_configure();
         }
     }
@@ -535,6 +563,8 @@ impl<BackendData: Backend> XdgForeignHandler for AnvilState<BackendData> {
 }
 smithay::delegate_xdg_foreign!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
 
+smithay::delegate_single_pixel_buffer!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
+
 impl<BackendData: Backend + 'static> AnvilState<BackendData> {
     pub fn init(
         display: Display<AnvilState<BackendData>>,
@@ -596,6 +626,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let presentation_state = PresentationState::new::<Self>(&dh, clock.id() as u32);
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
         let xdg_foreign_state = XdgForeignState::new::<Self>(&dh);
+        let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
         TextInputManagerState::new::<Self>(&dh);
         InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
         VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
@@ -654,6 +685,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             presentation_state,
             fractional_scale_manager_state,
             xdg_foreign_state,
+            single_pixel_buffer_state,
             dnd_icon: None,
             suppressed_keys: Vec::new(),
             cursor_status: CursorImageStatus::default_named(),
@@ -678,6 +710,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
     pub fn start_xwayland(&mut self) {
         use std::process::Stdio;
 
+        use smithay::wayland::compositor::CompositorHandler;
+
         let (xwayland, client) = XWayland::spawn(
             &self.display_handle,
             None,
@@ -696,6 +730,12 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                     x11_socket,
                     display_number,
                 } => {
+                    let xwayland_scale = std::env::var("ANVIL_XWAYLAND_SCALE")
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(1);
+                    data.client_compositor_state(&client)
+                        .set_client_scale(xwayland_scale);
                     let mut wm = X11Wm::start_wm(data.handle.clone(), x11_socket, client.clone())
                         .expect("Failed to attach X11 Window Manager");
 

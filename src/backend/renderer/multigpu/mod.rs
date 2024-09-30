@@ -41,15 +41,14 @@
 //!
 use std::{
     any::{Any, TypeId},
-    cell::{Ref, RefCell},
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt,
-    rc::Rc,
+    sync::{Arc, Mutex},
 };
 
 use super::{
-    sync::SyncPoint, Bind, Blit, DebugFlags, ExportMem, Frame, ImportDma, ImportMem, Offscreen, Renderer,
-    Texture, TextureFilter, TextureMapping, Unbind,
+    sync::SyncPoint, Bind, Blit, Color32F, DebugFlags, ExportMem, Frame, ImportDma, ImportMem, Offscreen,
+    Renderer, Texture, TextureFilter, TextureMapping, Unbind,
 };
 #[cfg(feature = "wayland_frontend")]
 use super::{ImportDmaWl, ImportMemWl};
@@ -63,6 +62,7 @@ use crate::{
     backend::{
         allocator::{
             dmabuf::{AnyError, Dmabuf},
+            format::FormatSet,
             Allocator, Buffer as BufferTrait, Format, Fourcc, Modifier,
         },
         drm::DrmNode,
@@ -450,7 +450,7 @@ impl<A: GraphicsApi> GpuManager<A> {
         <<A::Device as ApiDevice>::Renderer as ExportMem>::TextureMapping: 'static,
     {
         use crate::{
-            backend::renderer::utils::RendererSurfaceState,
+            backend::renderer::utils::RendererSurfaceStateUserData,
             wayland::compositor::{with_surface_tree_upward, TraversalAction},
         };
 
@@ -463,8 +463,8 @@ impl<A: GraphicsApi> GpuManager<A> {
             surface,
             (),
             |_surface, states, _| {
-                if let Some(data) = states.data_map.get::<RefCell<RendererSurfaceState>>() {
-                    let mut data_ref = data.borrow_mut();
+                if let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() {
+                    let mut data_ref = data.lock().unwrap();
                     let data = &mut *data_ref;
                     if data.textures.is_empty() {
                         // Import a new buffer if available
@@ -533,7 +533,7 @@ impl<A: GraphicsApi> GpuManager<A> {
         match buffer_type(buffer) {
             Some(BufferType::Dma) => {
                 let dmabuf = get_dmabuf(buffer).unwrap();
-                let mut texture = MultiTexture::from_surface(Some(surface), dmabuf.size());
+                let mut texture = MultiTexture::from_surface(Some(surface), dmabuf.size(), dmabuf.format());
 
                 if !self.devices.iter().any(|device| target_node == *device.node()) {
                     return Err(Error::DeviceMissing);
@@ -544,7 +544,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                 let src_node = import_on_src_node(dmabuf, Some(damage), &mut texture, first, None, devices)?;
 
                 if src_node != target_node {
-                    let mut texture_internal = texture.0.borrow_mut();
+                    let mut texture_internal = texture.0.lock().unwrap();
                     let api_textures = texture_internal.textures.get_mut(&TypeId::of::<A>()).unwrap();
 
                     {
@@ -634,7 +634,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                         texture.size(),
                         mappings.into_iter(),
                     );
-                    surface.data_map.insert_if_missing(|| texture.0);
+                    surface.data_map.insert_if_missing_threadsafe(|| texture.0);
                 }
 
                 Ok(())
@@ -653,6 +653,10 @@ impl<A: GraphicsApi> GpuManager<A> {
             }
             Some(BufferType::Shm) => {
                 // we just need to upload in import_shm_buffer
+                Ok(())
+            }
+            Some(BufferType::SinglePixel) => {
+                // no need to do anything
                 Ok(())
             }
             None => {
@@ -857,6 +861,7 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<R::Device as ApiDevice>::Renderer as Renderer>::TextureId: Clone + Send,
     <<R::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
 {
@@ -888,6 +893,7 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<R::Device as ApiDevice>::Renderer as Renderer>::TextureId: Clone + Send,
     <<R::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
 {
@@ -927,6 +933,7 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<R::Device as ApiDevice>::Renderer as Renderer>::TextureId: Clone + Send,
     <<R::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
 {
@@ -940,7 +947,7 @@ where
         }
     }
 
-    fn supported_formats(&self) -> Option<HashSet<crate::backend::allocator::Format>> {
+    fn supported_formats(&self) -> Option<FormatSet> {
         if let Some(target) = self.target.as_ref() {
             Bind::<Target>::supported_formats(target.device.renderer())
         } else {
@@ -958,6 +965,7 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<R::Device as ApiDevice>::Renderer as Renderer>::TextureId: Clone + Send,
     <<R::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
 {
@@ -1094,6 +1102,22 @@ where
     fn wait(&mut self, sync: &sync::SyncPoint) -> Result<(), Self::Error> {
         self.render.renderer_mut().wait(sync).map_err(Error::Render)
     }
+
+    #[profiling::function]
+    fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {
+        if let Some(target) = self.target.as_mut() {
+            target
+                .device
+                .renderer_mut()
+                .cleanup_texture_cache()
+                .map_err(Error::Target)?;
+        }
+        self.render
+            .renderer_mut()
+            .cleanup_texture_cache()
+            .map_err(Error::Render)?;
+        Ok(())
+    }
 }
 
 fn create_shared_dma_framebuffer<R, T: GraphicsApi>(
@@ -1111,8 +1135,10 @@ where
     <<T::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
 {
     let target_formats = ImportDma::dmabuf_formats(target.device.renderer())
+        .iter()
         .filter(|format| format.code == target.format)
-        .collect::<HashSet<Format>>();
+        .copied()
+        .collect::<FormatSet>();
     let render_formats = Bind::<Dmabuf>::supported_formats(src.renderer()).unwrap_or_default();
     let formats = target_formats.intersection(&render_formats);
     let target_modifiers = formats
@@ -1204,7 +1230,7 @@ where
                         .map_err(Error::Target)?;
                     frame.wait(&sync).map_err(Error::Target)?;
                     frame
-                        .clear([0.0, 0.0, 0.0, 0.0], &damage)
+                        .clear(Color32F::TRANSPARENT, &damage)
                         .map_err(Error::Target)?;
                     frame
                         .render_texture_from_to(
@@ -1218,6 +1244,10 @@ where
                         )
                         .map_err(Error::Target)?;
                     let sync = frame.finish().map_err(Error::Target)?;
+                    render
+                        .renderer_mut()
+                        .cleanup_texture_cache()
+                        .map_err(Error::Render)?;
 
                     return Ok(sync);
                 }
@@ -1269,6 +1299,10 @@ where
                 }
 
                 if mappings.is_empty() {
+                    render
+                        .renderer_mut()
+                        .cleanup_texture_cache()
+                        .map_err(Error::Render)?;
                     return Ok(sync::SyncPoint::signaled());
                 }
 
@@ -1299,7 +1333,9 @@ where
                         let src = Rectangle::from_loc_and_size(damage_rect.loc - rect.loc, damage_rect.size)
                             .to_f64();
                         let damage = &[Rectangle::from_loc_and_size((0, 0), dst.size)];
-                        frame.clear([0.0, 0.0, 0.0, 0.0], &[dst]).map_err(Error::Target)?;
+                        frame
+                            .clear(Color32F::TRANSPARENT, &[dst])
+                            .map_err(Error::Target)?;
                         frame
                             .render_texture_from_to(
                                 &texture,
@@ -1313,9 +1349,18 @@ where
                             .map_err(Error::Target)?;
                     }
                 }
-                return frame.finish().map_err(Error::Target);
+                let sync = frame.finish().map_err(Error::Target)?;
+                render
+                    .renderer_mut()
+                    .cleanup_texture_cache()
+                    .map_err(Error::Render)?;
+                return Ok(sync);
             }
 
+            render
+                .renderer_mut()
+                .cleanup_texture_cache()
+                .map_err(Error::Render)?;
             return Ok(sync);
         }
 
@@ -1343,13 +1388,18 @@ where
 
 /// [`Texture`]s produced by a [`MultiRenderer`].
 #[derive(Debug, Clone)]
-pub struct MultiTexture(Rc<RefCell<MultiTextureInternal>>);
+pub struct MultiTexture(Arc<Mutex<MultiTextureInternal>>);
 #[derive(Debug)]
 struct MultiTextureInternal {
     textures: HashMap<TypeId, HashMap<DrmNode, GpuSingleTexture>>,
     size: Size<i32, BufferCoords>,
     format: Option<Fourcc>,
+    #[allow(dead_code)]
+    buffer_format: Format,
 }
+// SAFETY: We require `Send` for textures of renderers suitable for the MultiRenderer.
+//  Type erasure just forces us to do this instead.
+unsafe impl Send for MultiTextureInternal {}
 
 type DamageAnyTextureMappings = Vec<(Rectangle<i32, BufferCoords>, Box<dyn Any + 'static>)>;
 
@@ -1374,70 +1424,79 @@ impl MultiTexture {
     fn from_surface(
         surface: Option<&crate::wayland::compositor::SurfaceData>,
         size: Size<i32, BufferCoords>,
+        buffer_format: Format,
     ) -> MultiTexture {
         let internal = surface
             .and_then(|surface| {
                 surface
                     .data_map
-                    .get::<Rc<RefCell<MultiTextureInternal>>>()
+                    .get::<Arc<Mutex<MultiTextureInternal>>>()
                     .cloned()
             })
             .unwrap_or_else(|| {
-                Rc::new(RefCell::new(MultiTextureInternal {
+                Arc::new(Mutex::new(MultiTextureInternal {
                     textures: HashMap::new(),
                     size,
                     format: None,
+                    buffer_format,
                 }))
             });
         {
-            let mut internal = internal.borrow_mut();
-            if internal.size != size {
+            let mut internal = internal.lock().unwrap();
+            if internal.size != size || internal.buffer_format != buffer_format {
                 internal.textures.clear();
+                internal.format = None;
                 internal.size = size;
+                internal.buffer_format = buffer_format;
             }
         }
         MultiTexture(internal)
     }
 
-    fn new(size: Size<i32, BufferCoords>) -> MultiTexture {
-        MultiTexture(Rc::new(RefCell::new(MultiTextureInternal {
+    fn new(size: Size<i32, BufferCoords>, buffer_format: Format) -> MultiTexture {
+        MultiTexture(Arc::new(Mutex::new(MultiTextureInternal {
             textures: HashMap::new(),
             size,
             format: None,
+            buffer_format,
         })))
     }
 
-    fn get<A: GraphicsApi + 'static>(
+    /// Attempt to get a texture of type `T: Renderer::TextureId` given the renderer type `A` for the given `DrmNode`.
+    ///
+    /// Will return `None` if either:
+    ///
+    /// - No textures are available for the Renderer type `A``
+    /// - No texture of type `T` is available for the given `DrmNode`
+    pub fn get<A: GraphicsApi + 'static>(
         &self,
         render: &DrmNode,
-    ) -> Option<Ref<'_, <<A::Device as ApiDevice>::Renderer as Renderer>::TextureId>>
+    ) -> Option<<<A::Device as ApiDevice>::Renderer as Renderer>::TextureId>
     where
-        <<A::Device as ApiDevice>::Renderer as Renderer>::TextureId: 'static,
+        <<A::Device as ApiDevice>::Renderer as Renderer>::TextureId: Clone + Send + 'static,
     {
-        let tex = self.0.borrow();
-        Ref::filter_map(tex, |tex| {
-            tex.textures
-                .get(&TypeId::of::<A>())
-                .and_then(|textures| textures.get(render))
-                .and_then(|texture| match texture {
-                    GpuSingleTexture::Direct(texture) => Some(texture),
-                    GpuSingleTexture::Dma { texture, .. } => Some(texture),
-                    GpuSingleTexture::Mem { texture, .. } => texture.as_ref(),
-                })
-                .and_then(|texture| {
-                    <dyn Any>::downcast_ref::<<<A::Device as ApiDevice>::Renderer as Renderer>::TextureId>(
-                        &**texture,
-                    )
-                })
-        })
-        .ok()
+        let tex = self.0.lock().unwrap();
+        tex.textures
+            .get(&TypeId::of::<A>())
+            .and_then(|textures| textures.get(render))
+            .and_then(|texture| match texture {
+                GpuSingleTexture::Direct(texture) => Some(texture),
+                GpuSingleTexture::Dma { texture, .. } => Some(texture),
+                GpuSingleTexture::Mem { texture, .. } => texture.as_ref(),
+            })
+            .and_then(|texture| {
+                <dyn Any>::downcast_ref::<<<A::Device as ApiDevice>::Renderer as Renderer>::TextureId>(
+                    &**texture,
+                )
+            })
+            .cloned()
     }
 
     fn needs_synchronization<A: GraphicsApi + 'static>(&self, render: &DrmNode) -> Option<SyncPoint>
     where
         <<A::Device as ApiDevice>::Renderer as Renderer>::TextureId: 'static,
     {
-        let mut tex = self.0.borrow_mut();
+        let mut tex = self.0.lock().unwrap();
         tex.textures
             .get_mut(&TypeId::of::<A>())
             .and_then(|textures| textures.get_mut(render))
@@ -1455,7 +1514,7 @@ impl MultiTexture {
     ) where
         <<A::Device as ApiDevice>::Renderer as Renderer>::TextureId: 'static,
     {
-        let mut tex = self.0.borrow_mut();
+        let mut tex = self.0.lock().unwrap();
         let format = texture.format();
         if format != tex.format && !tex.textures.is_empty() {
             warn!(has = ?tex.format, got = ?format, "Multi-SubTexture with wrong format!");
@@ -1465,7 +1524,7 @@ impl MultiTexture {
 
         trace!(
             "Inserting into: {:p} for {:?}: {:?}",
-            self.0.as_ptr(),
+            Arc::as_ptr(&self.0),
             render,
             tex
         );
@@ -1493,7 +1552,7 @@ impl MultiTexture {
         <T::Device as ApiDevice>::Renderer: ExportMem,
         <<T::Device as ApiDevice>::Renderer as ExportMem>::TextureMapping: 'static,
     {
-        let mut tex_ref = self.0.borrow_mut();
+        let mut tex_ref = self.0.lock().unwrap();
         let tex = &mut *tex_ref;
 
         let textures = tex.textures.entry(TypeId::of::<R>()).or_default();
@@ -1554,16 +1613,16 @@ impl MultiTexture {
 
 impl Texture for MultiTexture {
     fn size(&self) -> Size<i32, BufferCoords> {
-        self.0.borrow().size
+        self.0.lock().unwrap().size
     }
     fn width(&self) -> u32 {
-        self.0.borrow().size.w as u32
+        self.0.lock().unwrap().size.w as u32
     }
     fn height(&self) -> u32 {
-        self.0.borrow().size.h as u32
+        self.0.lock().unwrap().size.h as u32
     }
     fn format(&self) -> Option<Fourcc> {
-        self.0.borrow().format
+        self.0.lock().unwrap().format
     }
 }
 
@@ -1575,6 +1634,7 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<R::Device as ApiDevice>::Renderer as Renderer>::TextureId: Clone + Send,
     <<R::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
 {
@@ -1587,7 +1647,7 @@ where
 
     #[instrument(level = "trace", parent = &self.span, skip(self))]
     #[profiling::function]
-    fn clear(&mut self, color: [f32; 4], at: &[Rectangle<i32, Physical>]) -> Result<(), Error<R, T>> {
+    fn clear(&mut self, color: Color32F, at: &[Rectangle<i32, Physical>]) -> Result<(), Error<R, T>> {
         self.damage.extend(at);
         self.frame
             .as_mut()
@@ -1602,7 +1662,7 @@ where
         &mut self,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
-        color: [f32; 4],
+        color: Color32F,
     ) -> Result<(), Self::Error> {
         self.damage.extend(damage.iter().copied().map(|mut rect| {
             rect.loc += dst.loc;
@@ -1647,9 +1707,9 @@ where
         } else {
             warn!(
                 "Failed to render texture {:?}, import for wrong devices {:?}? {:?}",
-                texture.0.as_ptr(),
+                Arc::as_ptr(&texture.0),
                 self.node,
-                texture.0.borrow(),
+                texture.0.lock().unwrap(),
             );
             Ok(())
         }
@@ -1680,6 +1740,7 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<R::Device as ApiDevice>::Renderer as Renderer>::TextureId: Clone + Send,
     <<R::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
 {
@@ -1695,10 +1756,20 @@ where
             .render
             .renderer_mut()
             .import_shm_buffer(buffer, surface, damage)
-            .expect("import_shm_buffer without checking buffer type?");
-        let dimensions = shm::with_buffer_contents(buffer, |_, _, data| (data.width, data.height).into())
-            .map_err(|_| Error::ImportFailed)?;
-        let mut texture = MultiTexture::from_surface(surface, dimensions);
+            .map_err(Error::Render)?;
+        let (dimensions, format) = shm::with_buffer_contents(buffer, |_, _, data| {
+            Ok((
+                (data.width, data.height).into(),
+                shm::shm_format_to_fourcc(data.format)
+                    .map(|code| Format {
+                        code,
+                        modifier: Modifier::Linear,
+                    })
+                    .ok_or(Error::ImportFailed)?,
+            ))
+        })
+        .map_err(|_| Error::ImportFailed)??;
+        let mut texture = MultiTexture::from_surface(surface, dimensions, format);
         texture.insert_texture::<R>(*self.render.node(), shm_texture);
         Ok(texture)
     }
@@ -1717,6 +1788,7 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<R::Device as ApiDevice>::Renderer as Renderer>::TextureId: Clone + Send,
     <<R::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
 {
@@ -1734,7 +1806,13 @@ where
             .renderer_mut()
             .import_memory(data, format, size, flipped)
             .map_err(Error::Render)?;
-        let mut texture = MultiTexture::new(size);
+        let mut texture = MultiTexture::new(
+            size,
+            Format {
+                code: format,
+                modifier: Modifier::Linear,
+            },
+        );
         texture.insert_texture::<R>(*self.render.node(), mem_texture);
         Ok(texture)
     }
@@ -1773,6 +1851,7 @@ where
     R: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ImportDma + ImportMem,
+    <<R::Device as ApiDevice>::Renderer as Renderer>::TextureId: Clone + Send,
     <<R::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
 {
@@ -1785,12 +1864,12 @@ where
         damage: &[Rectangle<i32, BufferCoords>],
     ) -> Result<<Self as Renderer>::TextureId, <Self as Renderer>::Error> {
         let dmabuf = get_dmabuf(buffer).expect("import_dma_buffer without checking buffer type?");
-        let texture = MultiTexture::from_surface(surface, dmabuf.size());
+        let texture = MultiTexture::from_surface(surface, dmabuf.size(), dmabuf.format());
         let texture_ref = texture.0.clone();
         let res = self.import_dmabuf_internal(dmabuf, texture, Some(damage));
         if res.is_ok() {
             if let Some(surface) = surface {
-                surface.data_map.insert_if_missing(|| texture_ref);
+                surface.data_map.insert_if_missing_threadsafe(|| texture_ref);
             }
         }
         res
@@ -1808,10 +1887,11 @@ where
     R: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<R::Device as ApiDevice>::Renderer as Renderer>::TextureId: Clone + Send,
     <<R::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
 {
-    fn dmabuf_formats(&self) -> Box<dyn Iterator<Item = Format>> {
+    fn dmabuf_formats(&self) -> FormatSet {
         ImportDma::dmabuf_formats(self.render.renderer())
     }
 
@@ -1826,7 +1906,7 @@ where
         dmabuf: &Dmabuf,
         damage: Option<&[Rectangle<i32, BufferCoords>]>,
     ) -> Result<<Self as Renderer>::TextureId, <Self as Renderer>::Error> {
-        let texture = MultiTexture::new(dmabuf.size());
+        let texture = MultiTexture::new(dmabuf.size(), dmabuf.format());
         self.import_dmabuf_internal(dmabuf, texture, damage)
     }
 }
@@ -1928,8 +2008,10 @@ where
     } else {
         ImportDma::dmabuf_formats(src.renderer())
     }
+    .iter()
     .filter(|f| f.code == format)
-    .collect::<HashSet<_>>();
+    .copied()
+    .collect::<FormatSet>();
     let write_formats = Bind::<Dmabuf>::supported_formats(src.renderer()).unwrap_or_default();
     let modifiers = read_formats
         .intersection(&write_formats)
@@ -1990,6 +2072,9 @@ where
     .filter(|_| !is_new_buffer)
     .unwrap_or(&damage_slice);
 
+    frame
+        .clear(Color32F::TRANSPARENT, damage)
+        .map_err(Error::Render)?;
     frame
         .render_texture_from_to(
             src_texture,
@@ -2317,6 +2402,7 @@ where
     R: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<R::Device as ApiDevice>::Renderer as Renderer>::TextureId: Clone + Send,
     <<R::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
 {
@@ -2346,7 +2432,7 @@ where
                 .as_ref()
                 .is_some_and(|target| src_node == *target.device.node())
             {
-                let mut texture_internal = texture.0.borrow_mut();
+                let mut texture_internal = texture.0.lock().unwrap();
                 // make sure our target exists
                 texture_internal.textures.entry(TypeId::of::<R>()).or_default();
 
@@ -2397,7 +2483,7 @@ where
                 .iter_mut()
                 .find(|other| src_node == *other.node())
             {
-                let mut texture_internal = texture.0.borrow_mut();
+                let mut texture_internal = texture.0.lock().unwrap();
                 let api_textures = texture_internal.textures.get_mut(&TypeId::of::<R>()).unwrap();
                 let mut target_texture = api_textures.remove(self.render.node());
                 let src_texture = match api_textures.get(&src_node).unwrap() {
@@ -2513,6 +2599,7 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<R::Device as ApiDevice>::Renderer as Renderer>::TextureId: Clone + Send,
     <<R::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
 {
@@ -2604,6 +2691,7 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<R::Device as ApiDevice>::Renderer as Renderer>::TextureId: Clone + Send,
     <<R::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as Renderer>::Error: 'static,
 {

@@ -2,12 +2,17 @@ use std::cell::RefCell;
 
 #[cfg(feature = "xwayland")]
 use smithay::xwayland::XWaylandClientData;
+
+#[cfg(feature = "udev")]
+use smithay::wayland::drm_syncobj::DrmSyncobjCachedState;
+
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
     desktop::{
         layer_map_for_output, space::SpaceElement, LayerSurface, PopupKind, PopupManager, Space,
         WindowSurfaceType,
     },
+    input::pointer::{CursorImageStatus, CursorImageSurfaceData},
     output::Output,
     reexports::{
         calloop::Interest,
@@ -30,7 +35,7 @@ use smithay::{
                 Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler,
                 WlrLayerShellState,
             },
-            xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
+            xdg::XdgToplevelSurfaceData,
         },
     },
 };
@@ -111,10 +116,21 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
 
     fn new_surface(&mut self, surface: &WlSurface) {
         add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
+            #[cfg(feature = "udev")]
+            let mut acquire_point = None;
             let maybe_dmabuf = with_states(surface, |surface_data| {
+                #[cfg(feature = "udev")]
+                acquire_point.clone_from(
+                    &surface_data
+                        .cached_state
+                        .get::<DrmSyncobjCachedState>()
+                        .pending()
+                        .acquire_point,
+                );
                 surface_data
                     .cached_state
-                    .pending::<SurfaceAttributes>()
+                    .get::<SurfaceAttributes>()
+                    .pending()
                     .buffer
                     .as_ref()
                     .and_then(|assignment| match assignment {
@@ -123,6 +139,21 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
                     })
             });
             if let Some(dmabuf) = maybe_dmabuf {
+                #[cfg(feature = "udev")]
+                if let Some(acquire_point) = acquire_point {
+                    if let Ok((blocker, source)) = acquire_point.generate_blocker() {
+                        let client = surface.client().unwrap();
+                        let res = state.handle.insert_source(source, move |_, _, data| {
+                            let dh = data.display_handle.clone();
+                            data.client_compositor_state(&client).blocker_cleared(data, &dh);
+                            Ok(())
+                        });
+                        if res.is_ok() {
+                            add_blocker(surface, blocker);
+                            return;
+                        }
+                    }
+                }
                 if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
                     if let Some(client) = surface.client() {
                         let res = state.handle.insert_source(source, move |_, _, data| {
@@ -150,9 +181,62 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
             }
             if let Some(window) = self.window_for_surface(&root) {
                 window.0.on_commit();
+
+                if &root == surface {
+                    let buffer_offset = with_states(surface, |states| {
+                        states
+                            .cached_state
+                            .get::<SurfaceAttributes>()
+                            .current()
+                            .buffer_delta
+                            .take()
+                    });
+
+                    if let Some(buffer_offset) = buffer_offset {
+                        let current_loc = self.space.element_location(&window).unwrap();
+                        self.space.map_element(window, current_loc + buffer_offset, false);
+                    }
+                }
             }
         }
         self.popups.commit(surface);
+
+        if matches!(&self.cursor_status, CursorImageStatus::Surface(cursor_surface) if cursor_surface == surface)
+        {
+            with_states(surface, |states| {
+                let cursor_image_attributes = states.data_map.get::<CursorImageSurfaceData>();
+
+                if let Some(mut cursor_image_attributes) =
+                    cursor_image_attributes.map(|attrs| attrs.lock().unwrap())
+                {
+                    let buffer_delta = states
+                        .cached_state
+                        .get::<SurfaceAttributes>()
+                        .current()
+                        .buffer_delta
+                        .take();
+                    if let Some(buffer_delta) = buffer_delta {
+                        tracing::trace!(hotspot = ?cursor_image_attributes.hotspot, ?buffer_delta, "decrementing cursor hotspot");
+                        cursor_image_attributes.hotspot -= buffer_delta;
+                    }
+                }
+            });
+        }
+
+        if matches!(&self.dnd_icon, Some(icon) if &icon.surface == surface) {
+            let dnd_icon = self.dnd_icon.as_mut().unwrap();
+            with_states(&dnd_icon.surface, |states| {
+                let buffer_delta = states
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .current()
+                    .buffer_delta
+                    .take()
+                    .unwrap_or_default();
+                tracing::trace!(offset = ?dnd_icon.offset, ?buffer_delta, "moving dnd offset");
+                dnd_icon.offset += buffer_delta;
+            });
+        }
 
         ensure_initial_configure(surface, &self.space, &mut self.popups)
     }
@@ -267,16 +351,7 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
             }
         };
 
-        let initial_configure_sent = with_states(surface, |states| {
-            states
-                .data_map
-                .get::<XdgPopupSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .initial_configure_sent
-        });
-        if !initial_configure_sent {
+        if !popup.is_initial_configure_sent() {
             // NOTE: This should never fail as the initial configure is always
             // allowed.
             popup.send_configure().expect("initial configure failed");

@@ -191,9 +191,6 @@ macro_rules! xdg_role {
                 /// during the first commit a initial
                 /// configure event is sent to the client
                 pub initial_configure_sent: bool,
-                /// An `zxdg_toplevel_decoration_v1::configure` event has been sent
-                /// to the client.
-                pub initial_decoration_configure_sent: bool,
                 /// Holds the configures the server has sent out
                 /// to the client waiting to be acknowledged by
                 /// the client. All pending configures that are older
@@ -293,7 +290,6 @@ macro_rules! xdg_role {
                     configure_serial: None,
                     pending_configures: Vec::new(),
                     initial_configure_sent: false,
-                    initial_decoration_configure_sent: false,
                     server_pending: None,
                     last_acked: None,
                     current: Default::default(),
@@ -361,7 +357,10 @@ xdg_role!(
         ///
         /// For D-Bus activatable applications, the app ID is used as the D-Bus
         /// service name.
-        pub app_id: Option<String>
+        pub app_id: Option<String>,
+        /// An `zxdg_toplevel_decoration_v1::configure` event has been sent
+        /// to the client.
+        pub initial_decoration_configure_sent: bool
     }
 );
 
@@ -1527,6 +1526,22 @@ impl ToplevelSurface {
         serial
     }
 
+    /// Did the surface sent the initial
+    /// configure event to the client.
+    ///
+    /// Calls [`compositor::with_states`] internally.
+    pub fn is_initial_configure_sent(&self) -> bool {
+        compositor::with_states(&self.wl_surface, |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .initial_configure_sent
+        })
+    }
+
     /// Handles the role specific commit logic
     ///
     /// This should be called when the underlying WlSurface
@@ -1843,6 +1858,22 @@ impl PopupSurface {
         Ok(serial)
     }
 
+    /// Did the surface sent the initial
+    /// configure event to the client.
+    ///
+    /// Calls [`compositor::with_states`] internally.
+    pub fn is_initial_configure_sent(&self) -> bool {
+        compositor::with_states(&self.wl_surface, |states| {
+            states
+                .data_map
+                .get::<XdgPopupSurfaceData>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .initial_configure_sent
+        })
+    }
+
     /// Send a configure event, including the `repositioned` event to the client
     /// in response to a `reposition` request.
     ///
@@ -1851,11 +1882,11 @@ impl PopupSurface {
         self.send_configure_internal(Some(token))
     }
 
-    /// Handles the role specific commit logic
+    /// Handles the role specific commit error checking
     ///
     /// This should be called when the underlying WlSurface
     /// handles a wl_surface.commit request.
-    pub(crate) fn commit_hook<D: 'static>(
+    pub(crate) fn pre_commit_hook<D: 'static>(
         _state: &mut D,
         _dh: &DisplayHandle,
         surface: &wl_surface::WlSurface,
@@ -1879,9 +1910,18 @@ impl PopupSurface {
                 xdg_surface::Error::NotConstructed,
                 "Surface has not been configured yet.",
             );
-            return;
         }
+    }
 
+    /// Handles the role specific commit state application
+    ///
+    /// This should be called when the underlying WlSurface
+    /// applies a wl_surface.commit state.
+    pub(crate) fn post_commit_hook<D: 'static>(
+        _state: &mut D,
+        _dh: &DisplayHandle,
+        surface: &wl_surface::WlSurface,
+    ) {
         compositor::with_states(surface, |states| {
             let mut attributes = states
                 .data_map
@@ -1897,7 +1937,6 @@ impl PopupSurface {
                     }
                 }
             }
-            !attributes.initial_configure_sent
         });
     }
 

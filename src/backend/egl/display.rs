@@ -11,12 +11,15 @@ use std::{
     os::unix::io::{AsRawFd, FromRawFd, OwnedFd},
 };
 
+use indexmap::IndexSet;
 use libc::c_void;
+use once_cell::sync::Lazy;
 #[cfg(all(feature = "use_system_lib", feature = "wayland_frontend"))]
 use wayland_server::{protocol::wl_buffer::WlBuffer, DisplayHandle, Resource};
-#[cfg(feature = "use_system_lib")]
+#[cfg(all(feature = "use_system_lib", feature = "wayland_frontend"))]
 use wayland_sys::server::wl_display;
 
+use crate::backend::allocator::format::FormatSet;
 #[cfg(feature = "backend_drm")]
 use crate::backend::egl::EGLDevice;
 #[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
@@ -38,12 +41,8 @@ use crate::{
 use tracing::{debug, error, info, info_span, instrument, trace, warn};
 
 #[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
-lazy_static::lazy_static! {
-    pub(crate) static ref BUFFER_READER: Mutex<Option<WeakBufferReader>> = Mutex::new(None);
-}
-lazy_static::lazy_static! {
-    static ref DISPLAYS: Mutex<HashSet<WeakEGLDisplayHandle>> = Mutex::new(HashSet::new());
-}
+pub(crate) static BUFFER_READER: Mutex<Option<WeakBufferReader>> = Mutex::new(None);
+static DISPLAYS: Lazy<Mutex<HashSet<WeakEGLDisplayHandle>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 /// Wrapper around [`ffi::EGLDisplay`](ffi::egl::types::EGLDisplay) to ensure display is only destroyed
 /// once all resources bound to it have been dropped.
@@ -120,8 +119,8 @@ pub struct EGLDisplay {
     display: Arc<EGLDisplayHandle>,
     egl_version: (i32, i32),
     extensions: Vec<String>,
-    dmabuf_import_formats: HashSet<DrmFormat>,
-    dmabuf_render_formats: HashSet<DrmFormat>,
+    dmabuf_import_formats: FormatSet,
+    dmabuf_render_formats: FormatSet,
     surface_type: ffi::EGLint,
     pub(super) has_fences: bool,
     pub(super) supports_native_fences: bool,
@@ -592,12 +591,12 @@ impl EGLDisplay {
     }
 
     /// Returns a list of formats for dmabufs that can be rendered to.
-    pub fn dmabuf_render_formats(&self) -> &HashSet<DrmFormat> {
+    pub fn dmabuf_render_formats(&self) -> &FormatSet {
         &self.dmabuf_render_formats
     }
 
     /// Returns a list of formats for dmabufs that can be used as textures.
-    pub fn dmabuf_texture_formats(&self) -> &HashSet<DrmFormat> {
+    pub fn dmabuf_texture_formats(&self) -> &FormatSet {
         &self.dmabuf_import_formats
     }
 
@@ -870,10 +869,10 @@ impl EGLDisplay {
 fn get_dmabuf_formats(
     display: &ffi::egl::types::EGLDisplay,
     extensions: &[String],
-) -> Result<(HashSet<DrmFormat>, HashSet<DrmFormat>), EGLError> {
+) -> Result<(FormatSet, FormatSet), EGLError> {
     if !extensions.iter().any(|s| s == "EGL_EXT_image_dma_buf_import") {
         warn!("Dmabuf import extension not available");
-        return Ok((HashSet::new(), HashSet::new()));
+        return Ok((FormatSet::default(), FormatSet::default()));
     }
 
     let formats = {
@@ -893,7 +892,7 @@ fn get_dmabuf_formats(
                 ffi::egl::QueryDmaBufFormatsEXT(*display, 0, std::ptr::null_mut(), &mut num as *mut _)
             })?;
             if num == 0 {
-                return Ok((HashSet::new(), HashSet::new()));
+                return Ok((FormatSet::default(), FormatSet::default()));
             }
             let mut formats: Vec<u32> = Vec::with_capacity(num as usize);
             wrap_egl_call_bool(|| unsafe {
@@ -914,8 +913,8 @@ fn get_dmabuf_formats(
         }
     };
 
-    let mut texture_formats = HashSet::new();
-    let mut render_formats = HashSet::new();
+    let mut texture_formats = IndexSet::new();
+    let mut render_formats = IndexSet::new();
 
     for fourcc in formats {
         let mut num = 0i32;
@@ -997,25 +996,28 @@ fn get_dmabuf_formats(
     trace!("Supported dmabuf import formats: {:?}", texture_formats);
     trace!("Supported dmabuf render formats: {:?}", render_formats);
 
-    Ok((texture_formats, render_formats))
+    Ok((
+        FormatSet::from_formats(texture_formats),
+        FormatSet::from_formats(render_formats),
+    ))
 }
 
 /// Type to receive [`EGLBuffer`] for EGL-based [`WlBuffer`]s.
 ///
 /// Can be created by using [`EGLDisplay::bind_wl_display`].
-#[cfg(feature = "use_system_lib")]
+#[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
 #[derive(Debug, Clone)]
 pub struct EGLBufferReader {
     display: Arc<EGLDisplayHandle>,
     wayland: Option<Arc<*mut wl_display>>,
 }
 
-#[cfg(feature = "use_system_lib")]
+#[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
 pub(crate) struct WeakBufferReader {
     display: Weak<EGLDisplayHandle>,
 }
 
-#[cfg(feature = "use_system_lib")]
+#[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
 impl WeakBufferReader {
     pub fn upgrade(&self) -> Option<EGLBufferReader> {
         Some(EGLBufferReader {
@@ -1025,10 +1027,10 @@ impl WeakBufferReader {
     }
 }
 
-#[cfg(feature = "use_system_lib")]
+#[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
 unsafe impl Send for EGLBufferReader {}
 
-#[cfg(feature = "use_system_lib")]
+#[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
 impl EGLBufferReader {
     fn new(display: Arc<EGLDisplayHandle>, wayland: *mut wl_display) -> Self {
         #[allow(clippy::arc_with_non_send_sync)]
@@ -1213,7 +1215,7 @@ impl EGLBufferReader {
     }
 }
 
-#[cfg(feature = "use_system_lib")]
+#[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
 impl Drop for EGLBufferReader {
     fn drop(&mut self) {
         if let Some(wayland) = self.wayland.take().and_then(|x| Arc::try_unwrap(x).ok()) {

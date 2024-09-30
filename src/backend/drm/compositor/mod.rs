@@ -126,15 +126,16 @@ use std::{
     io::ErrorKind,
     os::unix::io::{AsFd, OwnedFd},
     rc::Rc,
+    str::FromStr,
     sync::{Arc, Mutex},
 };
 
 use drm::{
-    control::{connector, crtc, framebuffer, plane, Mode, PlaneType},
+    control::{connector, crtc, framebuffer, plane, Device as _, Mode, PlaneType},
     Device, DriverCapability,
 };
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use smallvec::SmallVec;
 use tracing::{debug, error, info, info_span, instrument, trace, warn};
 use wayland_server::{protocol::wl_buffer::WlBuffer, Resource};
@@ -162,13 +163,13 @@ use crate::{
             },
             sync::SyncPoint,
             utils::{CommitCounter, DamageBag, DamageSet, DamageSnapshot, OpaqueRegions},
-            Bind, Blit, DebugFlags, Frame as RendererFrame, Renderer, Texture,
+            Bind, Blit, Color32F, DebugFlags, Frame as RendererFrame, Renderer, Texture,
         },
         SwapBuffersError,
     },
     output::{OutputModeSource, OutputNoMode},
     utils::{Buffer as BufferCoords, DevPath, Physical, Point, Rectangle, Scale, Size, Transform},
-    wayland::shm,
+    wayland::{shm, single_pixel_buffer},
 };
 
 use super::{error::AccessError, DrmDeviceFd, DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes};
@@ -201,6 +202,22 @@ enum ScanoutBuffer<B: Buffer> {
     Wayland(crate::backend::renderer::utils::Buffer),
     Swapchain(Slot<B>),
     Cursor(GbmBuffer),
+}
+
+impl<B: Buffer> ScanoutBuffer<B> {
+    fn acquire_point(
+        &self,
+        signaled_fence: Option<&Arc<OwnedFd>>,
+    ) -> Option<(SyncPoint, Option<Arc<OwnedFd>>)> {
+        if let Self::Wayland(buffer) = self {
+            // Assume `DrmSyncobjBlocker` is used, so acquire point has already
+            // been signaled. Instead of converting with `SyncPoint::from`.
+            if buffer.acquire_point().is_some() {
+                return Some((SyncPoint::signaled(), signaled_fence.cloned()));
+            }
+        }
+        None
+    }
 }
 
 impl<B: Buffer> ScanoutBuffer<B> {
@@ -324,7 +341,7 @@ impl ElementFramebufferCacheKey {
     #[inline]
     fn is_alive(&self) -> bool {
         match self.buffer {
-            ElementFramebufferCacheBuffer::Wayland(ref buffer) => buffer.upgrade().is_ok(),
+            ElementFramebufferCacheBuffer::Wayland(ref buffer) => buffer.is_alive(),
         }
     }
 }
@@ -332,7 +349,7 @@ impl ElementFramebufferCacheKey {
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 struct PlanesSnapshot {
     primary: bool,
-    cursor: bool,
+    cursor_bitmask: u32,
     overlay_bitmask: u32,
 }
 
@@ -628,13 +645,15 @@ impl<B> Clone for Owned<B> {
 }
 
 impl<B: Framebuffer> FrameState<B> {
-    fn from_planes(planes: &Planes) -> Self {
-        let cursor_plane_count = usize::from(planes.cursor.is_some());
-        let mut tmp = SmallVec::with_capacity(planes.overlay.len() + cursor_plane_count + 1);
-        tmp.push((planes.primary.handle, PlaneState::default()));
-        if let Some(info) = planes.cursor.as_ref() {
-            tmp.push((info.handle, PlaneState::default()));
-        }
+    fn from_planes(primary_plane: plane::Handle, planes: &Planes) -> Self {
+        let mut tmp = SmallVec::with_capacity(planes.overlay.len() + planes.cursor.len() + 1);
+        tmp.push((primary_plane, PlaneState::default()));
+        tmp.extend(
+            planes
+                .cursor
+                .iter()
+                .map(|info| (info.handle, PlaneState::default())),
+        );
         tmp.extend(
             planes
                 .overlay
@@ -784,7 +803,22 @@ impl<B: Framebuffer> FrameState<B> {
                 // actually used. We can skip getting a claim here if we have a
                 // config as this means we already claimed the plane for us.
                 if allow_partial_update {
-                    !state.skip
+                    // A partial update would technically only have to include planes that
+                    // actually changed. This includes planes we previously used and have to
+                    // reset and planes we use and want to update.
+                    // Both is already encoded into state.skip, so this should be the only
+                    // thing we have to consider here.
+                    //
+                    // But...Unfortunately some drivers seem to have issues with partial
+                    // updates, at least when it does not contain the primary plane, resulting
+                    // in strange issues like e.g. repeating plane content, side-scrolling planes,
+                    // wrapping planes around edges...
+                    //
+                    // So until these things are fixed just always send the whole state. We do not
+                    // have to send planes we never used, but we include planes we want to reset or
+                    // that explicitly changed represented by !state.skip and all planes currently in
+                    // use represented by having an config defined.
+                    !state.skip || state.config.is_some()
                 } else {
                     state.config.is_some() || surface.claim_plane(*handle).is_some()
                 }
@@ -963,14 +997,14 @@ pub enum PrimaryPlaneElement<'a, B: Buffer, F: Framebuffer, E> {
 ///
 /// Keeping the buffer longer may cause the following issues:
 /// - **Too much damage** - until the buffer is marked free it is not considered
-/// submitted by the swapchain, causing the age value of newly queried buffers
-/// to be lower than necessary, potentially resulting in more rendering than necessary.
-/// To avoid this make sure the buffer is dropped before starting the next render.
+///   submitted by the swapchain, causing the age value of newly queried buffers
+///   to be lower than necessary, potentially resulting in more rendering than necessary.
+///   To avoid this make sure the buffer is dropped before starting the next render.
 /// - **Exhaustion of swapchain images** - Continuing rendering while holding on
-/// to too many buffers may cause the swapchain to run out of images, returning errors
-/// on rendering until buffers are freed again. The exact amount of images in a
-/// swapchain is an implementation detail, but should generally be expect to be
-/// large enough to hold onto at least one `RenderFrameResult`.
+///   to too many buffers may cause the swapchain to run out of images, returning errors
+///   on rendering until buffers are freed again. The exact amount of images in a
+///   swapchain is an implementation detail, but should generally be expect to be
+///   large enough to hold onto at least one `RenderFrameResult`.
 pub struct RenderFrameResult<'a, B: Buffer, F: Framebuffer, E> {
     /// If this frame contains any changes and should be submitted
     pub is_empty: bool,
@@ -993,7 +1027,7 @@ impl<'a, B: Buffer, F: Framebuffer, E> RenderFrameResult<'a, B, F, E> {
     /// Returns if synchronization with kms submission can't be guaranteed through the available apis.
     pub fn needs_sync(&self) -> bool {
         if let PrimaryPlaneElement::Swapchain(ref element) = self.primary_element {
-            !element.sync.is_reached() && (!self.supports_fencing || !element.sync.is_exportable())
+            !self.supports_fencing || !element.sync.is_exportable()
         } else {
             false
         }
@@ -1140,6 +1174,7 @@ where
     where
         E: Element,
     {
+        #[allow(clippy::mutable_key_type)]
         let filter_ids: HashSet<Id> = filter.into_iter().collect();
 
         let mut elements: Vec<FrameResultDamageElement<'_, '_, E, B>> =
@@ -1205,6 +1240,7 @@ where
     {
         let size = size.into();
         let scale = scale.into();
+        #[allow(clippy::mutable_key_type)]
         let filter_ids: HashSet<Id> = filter.into_iter().collect();
         let damage = damage.into_iter().collect::<Vec<_>>();
 
@@ -1267,7 +1303,7 @@ where
                 .map_err(BlitFrameResultError::Rendering)?;
 
             frame
-                .clear([0f32, 0f32, 0f32, 1f32], &clear_damage)
+                .clear(Color32F::BLACK, &clear_damage)
                 .map_err(BlitFrameResultError::Rendering)?;
 
             sync = Some(frame.finish().map_err(BlitFrameResultError::Rendering)?);
@@ -1547,6 +1583,7 @@ where
     supports_fencing: bool,
     direct_scanout: bool,
     reset_pending: bool,
+    signaled_fence: Option<Arc<OwnedFd>>,
 
     framebuffer_exporter: F,
 
@@ -1609,10 +1646,28 @@ where
         mut allocator: A,
         framebuffer_exporter: F,
         color_formats: &[DrmFourcc],
-        renderer_formats: HashSet<DrmFormat>,
+        renderer_formats: impl IntoIterator<Item = DrmFormat>,
         cursor_size: Size<u32, BufferCoords>,
         gbm: Option<GbmDevice<G>>,
     ) -> FrameResult<Self, A, F> {
+        let signaled_fence = match surface.create_syncobj(true) {
+            Ok(signaled_syncobj) => match surface.syncobj_to_fd(signaled_syncobj, true) {
+                Ok(signaled_fence) => {
+                    let _ = surface.destroy_syncobj(signaled_syncobj);
+                    Some(Arc::new(signaled_fence))
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "failed to export signaled syncobj");
+                    let _ = surface.destroy_syncobj(signaled_syncobj);
+                    None
+                }
+            },
+            Err(err) => {
+                tracing::warn!(?err, "failed to create signaled syncobj");
+                None
+            }
+        };
+
         let span = info_span!(
             parent: None,
             "drm_compositor",
@@ -1621,6 +1676,7 @@ where
         );
 
         let output_mode_source = output_mode_source.into();
+        let renderer_formats = renderer_formats.into_iter().collect::<Vec<_>>();
 
         let mut error = None;
         let surface = Arc::new(surface);
@@ -1631,7 +1687,7 @@ where
 
         // We do not support direct scan-out on legacy
         if surface.is_legacy() {
-            planes.cursor = None;
+            planes.cursor.clear();
             planes.overlay.clear();
         }
 
@@ -1670,7 +1726,7 @@ where
                     }))
                 })?
             && plane_has_property(&*surface, surface.plane(), "IN_FENCE_FD")?
-            && !is_nvidia;
+            && !(is_nvidia && nvidia_drm_version().unwrap_or((0, 0, 0)) < (560, 35, 3));
 
         for format in color_formats {
             debug!("Testing color format: {}", format);
@@ -1714,6 +1770,7 @@ where
                         primary_is_opaque: is_opaque,
                         direct_scanout: true,
                         reset_pending: true,
+                        signaled_fence,
                         current_frame,
                         pending_frame: None,
                         queued_frame: None,
@@ -1761,11 +1818,11 @@ where
         planes: &Planes,
         allocator: A,
         framebuffer_exporter: &F,
-        mut renderer_formats: HashSet<DrmFormat>,
+        mut renderer_formats: Vec<DrmFormat>,
         code: DrmFourcc,
     ) -> Result<(Swapchain<A>, Frame<A, F>, bool), (A, FrameErrorType<A, F>)> {
         // select a format
-        let mut plane_formats = planes.primary.formats.clone();
+        let mut plane_formats = drm.plane_info().formats.iter().copied().collect::<IndexSet<_>>();
 
         let opaque_code = get_opaque(code).unwrap_or(code);
         if !plane_formats
@@ -1783,16 +1840,16 @@ where
         let plane_modifiers = plane_formats
             .iter()
             .map(|fmt| fmt.modifier)
-            .collect::<HashSet<_>>();
+            .collect::<IndexSet<_>>();
         let renderer_modifiers = renderer_formats
             .iter()
             .map(|fmt| fmt.modifier)
-            .collect::<HashSet<_>>();
+            .collect::<IndexSet<_>>();
         debug!(
             "Remaining intersected modifiers: {:?}",
             plane_modifiers
                 .intersection(&renderer_modifiers)
-                .collect::<HashSet<_>>()
+                .collect::<IndexSet<_>>()
         );
 
         if plane_formats.is_empty() {
@@ -1813,7 +1870,7 @@ where
                     .all(|x| x.modifier != DrmModifier::Invalid)
                 && renderer_formats.iter().any(|x| x.modifier == DrmModifier::Linear))
                 || (renderer_formats.len() == 1
-                    && renderer_formats.iter().next().unwrap().modifier == DrmModifier::Invalid
+                    && renderer_formats.first().unwrap().modifier == DrmModifier::Invalid
                     && plane_formats.iter().all(|x| x.modifier != DrmModifier::Invalid)
                     && plane_formats.iter().any(|x| x.modifier == DrmModifier::Linear))
             {
@@ -1878,8 +1935,8 @@ where
 
         let mode_size = Size::from((mode.size().0 as i32, mode.size().1 as i32));
 
-        let mut current_frame_state = FrameState::from_planes(planes);
-        let plane_claim = match drm.claim_plane(planes.primary.handle) {
+        let mut current_frame_state = FrameState::from_planes(drm.plane(), planes);
+        let plane_claim = match drm.claim_plane(drm.plane()) {
             Some(claim) => claim,
             None => {
                 warn!("failed to claim primary plane",);
@@ -1909,8 +1966,7 @@ where
             }),
         };
 
-        match current_frame_state.test_state(&drm, supports_fencing, planes.primary.handle, plane_state, true)
-        {
+        match current_frame_state.test_state(&drm, supports_fencing, drm.plane(), plane_state, true) {
             Ok(_) => {
                 debug!("Chosen format: {:?}", dmabuf.format());
                 Ok((swapchain, current_frame_state, use_opaque))
@@ -1935,13 +1991,15 @@ where
         &mut self,
         renderer: &mut R,
         elements: &'a [E],
-        clear_color: [f32; 4],
+        clear_color: impl Into<Color32F>,
     ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
     where
         E: RenderElement<R>,
         R: Renderer + Bind<Dmabuf>,
         <R as Renderer>::TextureId: Texture + 'static,
     {
+        let mut clear_color = clear_color.into();
+
         if !self.surface.is_active() {
             return Err(RenderFrameErrorType::<A, F, R>::PrepareFrame(
                 FrameError::DrmError(DrmError::DeviceInactive),
@@ -2030,7 +2088,7 @@ where
                 .unwrap_or(&self.current_frame);
 
             // This will create an empty frame state, all planes are skipped by default
-            let mut next_frame_state = FrameState::from_planes(&self.planes);
+            let mut next_frame_state = FrameState::from_planes(self.surface.plane(), &self.planes);
 
             // We want to set skip to false on all planes that previously had something assigned so that
             // they get cleared when they are not longer used
@@ -2050,13 +2108,10 @@ where
 
         // We want to make sure we can actually scan-out the primary plane, so
         // explicitly set skip to false
-        let plane_claim = self
-            .surface
-            .claim_plane(self.planes.primary.handle)
-            .ok_or_else(|| {
-                error!("failed to claim primary plane");
-                FrameError::PrimaryPlaneClaimFailed
-            })?;
+        let plane_claim = self.surface.claim_plane(self.surface.plane()).ok_or_else(|| {
+            error!("failed to claim primary plane");
+            FrameError::PrimaryPlaneClaimFailed
+        })?;
         let primary_plane_state = PlaneState {
             skip: false,
             needs_test: false,
@@ -2082,7 +2137,7 @@ where
 
         // unconditionally set the primary plane state
         // if this would fail the test we are screwed anyway
-        next_frame_state.set_state(self.planes.primary.handle, primary_plane_state.clone());
+        next_frame_state.set_state(self.surface.plane(), primary_plane_state.clone());
 
         // This holds all elements that are visible on the output
         // A element is considered visible if it intersects with the output geometry
@@ -2091,7 +2146,7 @@ where
             Vec::with_capacity(elements.len());
 
         let mut element_opaque_regions_workhouse = std::mem::take(&mut self.element_opaque_regions_workhouse);
-        for element in elements.iter() {
+        for (index, element) in elements.iter().enumerate() {
             let element_id = element.id();
             let element_geometry = element.geometry(output_scale);
             let element_loc = element_geometry.loc;
@@ -2147,6 +2202,61 @@ where
                     .filter_map(|geo| geo.intersection(output_geometry)),
             );
 
+            // If the element is completely opaque and spans the whole output nothing below
+            // will be visible. In this case we can short-cut the whole loop and just mark all
+            // remaining elements as skipped.
+            //
+            // We also use this to special case for single pixel buffers that span the whole
+            // output. If the last visible element is a solid color we can override the clear
+            // color and remove the element completely. This will make the element directly above
+            // this element the last element, enabling direct scan-out on the primary plane for it.
+            if element_is_opaque && element_output_geometry.contains_rect(output_geometry) {
+                let element_color = element.underlying_storage(renderer).and_then(|storage| {
+                    if let UnderlyingStorage::Wayland(buffer) = storage {
+                        single_pixel_buffer::get_single_pixel_buffer(buffer)
+                            .ok()
+                            .map(|spb| Color32F::from(spb.rgba32f()))
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(color) = element_color {
+                    clear_color = color;
+
+                    render_element_states
+                        .states
+                        .entry(element_id.clone())
+                        .and_modify(|state| {
+                            if matches!(state.presentation_state, RenderElementPresentationState::Skipped) {
+                                *state = RenderElementState::rendered(element_visible_area);
+                            } else {
+                                state.visible_area += element_visible_area;
+                            }
+                        })
+                        .or_insert_with(|| RenderElementState::rendered(element_visible_area));
+                } else {
+                    output_elements.push((
+                        element,
+                        element_geometry,
+                        element_visible_area,
+                        element_is_opaque,
+                    ));
+                }
+
+                for element in elements.iter().skip(index + 1) {
+                    let element_id = element.id();
+                    // We allow multiple instance of a single element, so do not
+                    // override the state if we already have one
+                    if !render_element_states.states.contains_key(element_id) {
+                        render_element_states
+                            .states
+                            .insert(element_id.clone(), RenderElementState::skipped());
+                    }
+                }
+                break;
+            }
+
             output_elements.push((element, element_geometry, element_visible_area, element_is_opaque));
         }
         self.element_opaque_regions_workhouse = element_opaque_regions_workhouse;
@@ -2181,14 +2291,16 @@ where
             // on the primary plane.
             let try_assign_primary_plane = if remaining_elements == 1 && primary_plane_elements.is_empty() {
                 let crtc_background_matches_clear_color =
-                    (clear_color[0] == 0f32 && clear_color[1] == 0f32 && clear_color[2] == 0f32)
-                        || clear_color[3] == 0f32;
+                    (clear_color.r() == 0f32 && clear_color.g() == 0f32 && clear_color.b() == 0f32)
+                        || clear_color.a() == 0f32;
                 let element_spans_complete_output = element_geometry.contains_rect(output_geometry);
                 let overlaps_with_underlay = self
                     .planes
                     .overlay
                     .iter()
-                    .filter(|p| p.zpos.unwrap_or_default() < self.planes.primary.zpos.unwrap_or_default())
+                    .filter(|p| {
+                        p.zpos.unwrap_or_default() < self.surface.plane_info().zpos.unwrap_or_default()
+                    })
                     .any(|p| next_frame_state.overlaps(p.handle, element_geometry));
                 !overlaps_with_underlay
                     && (crtc_background_matches_clear_color
@@ -2291,15 +2403,9 @@ where
 
                 // Check if the element we are potentially going to remove is
                 // on the primary plane, cursor plane or an overlay plane
-                let element = if *plane == self.planes.primary.handle {
+                let element = if *plane == self.surface.plane() {
                     primary_plane_scanout_element.take()
-                } else if self
-                    .planes
-                    .cursor
-                    .as_ref()
-                    .map(|p| *plane == p.handle)
-                    .unwrap_or(false)
-                {
+                } else if self.planes.cursor.iter().any(|p| *plane == p.handle) {
                     cursor_plane_element.take()
                 } else {
                     overlay_plane_elements.shift_remove(plane)
@@ -2327,7 +2433,7 @@ where
             // to make sure we actually have a slot on the primary
             // plane we can render into
             if !removed_overlay_elements.is_empty() {
-                next_frame_state.set_state(self.planes.primary.handle, primary_plane_state);
+                next_frame_state.set_state(self.surface.plane(), primary_plane_state);
             }
 
             removed_overlay_elements.sort_by_key(|(z_index, _)| *z_index);
@@ -2353,7 +2459,7 @@ where
         }
 
         let render = next_frame_state
-            .plane_buffer(self.planes.primary.handle)
+            .plane_buffer(self.surface.plane())
             .map(|config| matches!(&config.buffer, ScanoutBuffer::Swapchain(_)))
             .unwrap_or(false);
 
@@ -2361,10 +2467,10 @@ where
             trace!(
                 "rendering {} elements on the primary {:?}",
                 primary_plane_elements.len(),
-                self.planes.primary.handle,
+                self.surface.plane(),
             );
             let (dmabuf, age) = {
-                let primary_plane_state = next_frame_state.plane_state(self.planes.primary.handle).unwrap();
+                let primary_plane_state = next_frame_state.plane_state(self.surface.plane()).unwrap();
                 let config = primary_plane_state.config.as_ref().unwrap();
                 let slot = match &config.buffer.buffer {
                     ScanoutBuffer::Swapchain(slot) => slot,
@@ -2411,7 +2517,7 @@ where
                         }
                     })
                     .unwrap_or_default();
-                let is_underlay = plane_z_pos < self.planes.primary.zpos.unwrap_or_default();
+                let is_underlay = plane_z_pos < self.surface.plane_info().zpos.unwrap_or_default();
                 if is_underlay {
                     Some(HolepunchRenderElement::from_render_element(id, element, output_scale).into())
                 } else {
@@ -2437,6 +2543,13 @@ where
 
             match render_res {
                 Ok(render_output_result) => {
+                    if render_output_result.damage.is_none() {
+                        // if we receive no damage we can assume no rendering took place
+                        // and we should trigger a cleanup of the renderer texture cache
+                        // to prevent holding textures longer then necessary
+                        let _ = renderer.cleanup_texture_cache();
+                    }
+
                     for (id, state) in render_output_result.states.states.into_iter() {
                         // Skip the state for our fake elements
                         if self.overlay_plane_element_ids.contains_plane_id(&id) {
@@ -2461,13 +2574,11 @@ where
                     // but now use it for rendering we do not replace the damage which is
                     // the whole plane initially.
                     let had_direct_scan_out = previous_state
-                        .plane_state(self.planes.primary.handle)
+                        .plane_state(self.surface.plane())
                         .map(|state| state.element_state.is_some())
                         .unwrap_or(true);
 
-                    let primary_plane_state = next_frame_state
-                        .plane_state_mut(self.planes.primary.handle)
-                        .unwrap();
+                    let primary_plane_state = next_frame_state.plane_state_mut(self.surface.plane()).unwrap();
                     let config = primary_plane_state.config.as_mut().unwrap();
 
                     if !had_direct_scan_out {
@@ -2495,7 +2606,7 @@ where
 
                             primary_plane_state.skip = true;
                             *config = previous_state
-                                .plane_state(self.planes.primary.handle)
+                                .plane_state(self.surface.plane())
                                 .and_then(|state| state.config.as_ref().cloned())
                                 .unwrap_or_else(|| config.clone());
                         }
@@ -2520,11 +2631,16 @@ where
                     return Err(RenderFrameError::from(err));
                 }
             }
+        } else {
+            // if we are constantly doing direct scan-out on the primary plane
+            // we have to cleanup the renderer texture cache as this would
+            // only happen implicit during rendering otherwise
+            let _ = renderer.cleanup_texture_cache();
         }
 
         let primary_plane_element = if render {
             let (slot, sync) = {
-                let primary_plane_state = next_frame_state.plane_state(self.planes.primary.handle).unwrap();
+                let primary_plane_state = next_frame_state.plane_state(self.surface.plane()).unwrap();
                 let config = primary_plane_state.config.as_ref().unwrap();
                 (
                     config.buffer.clone(),
@@ -2601,7 +2717,7 @@ where
             return Err(FrameErrorType::<A, F>::EmptyFrame);
         }
 
-        if let Some(plane_state) = prepared_frame.frame.plane_state(self.planes.primary.handle) {
+        if let Some(plane_state) = prepared_frame.frame.plane_state(self.surface.plane()) {
             if !plane_state.skip {
                 let slot = plane_state.buffer().and_then(|config| match &config.buffer {
                     ScanoutBuffer::Swapchain(slot) => Some(slot),
@@ -2676,7 +2792,7 @@ where
                 // the next call to render_frame
                 let primary_plane_element_state = prepared_frame
                     .frame
-                    .plane_state(self.planes.primary.handle)
+                    .plane_state(self.surface.plane())
                     .and_then(|plane_state| {
                         plane_state
                             .element_state
@@ -2903,7 +3019,7 @@ where
                     trace!(
                         "assigned element {:?} to primary {:?}",
                         element.id(),
-                        self.planes.primary.handle
+                        self.surface.plane()
                     );
                     return Ok(plane);
                 }
@@ -2921,11 +3037,7 @@ where
             output_transform,
             output_geometry,
         ) {
-            trace!(
-                "assigned element {:?} to cursor {:?}",
-                element.id(),
-                self.planes.cursor.as_ref().map(|p| p.handle)
-            );
+            trace!("assigned element {:?} to cursor {:?}", element.id(), plane.handle);
             return Ok(plane);
         }
 
@@ -2943,7 +3055,11 @@ where
             output_geometry,
         ) {
             Ok(plane) => {
-                trace!("assigned element {:?} to overlay plane", element.id());
+                trace!(
+                    "assigned element {:?} to overlay plane {:?}",
+                    element.id(),
+                    plane.handle
+                );
                 return Ok(plane);
             }
             Err(err) => rendering_reason = rendering_reason.or(err),
@@ -2975,7 +3091,7 @@ where
         E: RenderElement<R>,
     {
         if frame_state
-            .plane_state(self.planes.primary.handle)
+            .plane_state(self.surface.plane())
             .map(|state| state.element_state.is_some())
             .unwrap_or(true)
         {
@@ -2998,14 +3114,16 @@ where
             .planes
             .overlay
             .iter()
-            .filter(|plane| self.planes.primary.zpos.unwrap_or_default() > plane.zpos.unwrap_or_default())
+            .filter(|plane| {
+                self.surface.plane_info().zpos.unwrap_or_default() > plane.zpos.unwrap_or_default()
+            })
             .any(|plane| frame_state.is_assigned(plane.handle));
 
         if has_underlay {
             trace!(
                 "failed to assign element {:?} to primary {:?}, already has underlay",
                 element.id(),
-                self.planes.primary.handle
+                self.surface.plane()
             );
             return Err(None);
         }
@@ -3014,7 +3132,13 @@ where
             return Err(Some(RenderingReason::ScanoutFailed));
         }
 
-        let res = self.try_assign_plane(element, &element_config, &self.planes.primary, scale, frame_state);
+        let res = self.try_assign_plane(
+            element,
+            &element_config,
+            self.surface.plane_info(),
+            scale,
+            frame_state,
+        );
 
         if let Err(Some(RenderingReason::ScanoutFailed)) = res {
             element_config.failed_planes.primary = true;
@@ -3041,24 +3165,16 @@ where
         R: Renderer,
         E: RenderElement<R>,
     {
-        // if we have no cursor plane we can exit early
-        let plane_info = self.planes.cursor.as_ref()?;
-
-        // something is already assigned to our cursor plane
-        if frame_state.is_assigned(plane_info.handle) {
-            trace!(
-                "skipping element {:?} on cursor {:?}, plane already has element assigned",
-                element.id(),
-                plane_info.handle
-            );
+        let Some(cursor_state) = self.cursor_state.as_mut() else {
+            trace!("no cursor state, skipping cursor rendering");
             return None;
-        }
+        };
 
+        // only try to assgin elements on a cursor plane that indicate so
         if element.kind() != Kind::Cursor {
             trace!(
-                "skipping element {:?} on cursor {:?}, element kind not cursor",
+                "skipping element {:?} on cursor plane(s), element kind not cursor",
                 element.id(),
-                plane_info.handle
             );
             return None;
         }
@@ -3068,24 +3184,84 @@ where
         // if the element is greater than the cursor size we can not
         // use the cursor plane to scan out the element
         if element_size.w > self.cursor_size.w || element_size.h > self.cursor_size.h {
+            trace!("element {:?} too big for cursor plane(s), skipping", element.id(),);
+            return None;
+        }
+
+        // For now we only support a single cursor plane, so first test if we already
+        // assigned something to any cursor plane
+        if let Some(plane_info) = self
+            .planes
+            .cursor
+            .iter()
+            .find(|plane_info| frame_state.is_assigned(plane_info.handle))
+        {
             trace!(
-                "element {:?} too big for cursor {:?}, skipping",
+                "skipping element {:?} on cursor {:?}, plane already has element assigned",
                 element.id(),
-                plane_info.handle,
+                plane_info.handle
             );
             return None;
         }
 
-        let Some(cursor_state) = self.cursor_state.as_mut() else {
-            trace!("no cursor state, skipping cursor rendering");
+        let previous_state = self
+            .pending_frame
+            .as_ref()
+            .map(|pending| &pending.frame)
+            .unwrap_or(&self.current_frame);
+
+        // In case we have multiple cursor planes we will try to keep using
+        // the same cursor plane for as long as possible.
+        // So first we test the previous state for an assigned cursor plane and
+        // if that fails we will try to pick the first unclaimed cursor plane.
+        let Some((plane_info, plane_claim)) = self
+            .planes
+            .cursor
+            .iter()
+            .find_map(|plane_info: &PlaneInfo| {
+                if previous_state.is_assigned(plane_info.handle) {
+                    self.surface
+                        .claim_plane(plane_info.handle)
+                        .map(|claim| (plane_info, claim))
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                self.planes.cursor.iter().find_map(|plane_info| {
+                    self.surface
+                        .claim_plane(plane_info.handle)
+                        .map(|claim| (plane_info, claim))
+                })
+            })
+        else {
+            trace!(
+                "skipping element {:?} on cursor plane(s), no free plane found",
+                element.id(),
+            );
             return None;
+        };
+
+        let cursor_plane_size = if let Some(size_hints) = plane_info.size_hints.as_deref() {
+            // size hints are in order of preference, so we can choose the first one
+            // that can hold the whole element
+            //
+            // Note: we use the legacy cursor size as a pre-check and expect it to hold the
+            // biggest possible size
+            size_hints
+                .iter()
+                .find(|hint| hint.w as i32 >= element_size.w && hint.h as i32 >= element_size.h)
+                .map(|hint| Size::<i32, Physical>::from((hint.w as i32, hint.h as i32)))
+                .unwrap_or(self.cursor_size)
+        } else {
+            self.cursor_size
         };
 
         // this calculates the location of the cursor plane taking the simulated transform
         // into consideration
         let cursor_plane_location = output_transform
             .transform_point_in(element.location(scale), &output_geometry.size)
-            - output_transform.transform_point_in(Point::default(), &self.cursor_size);
+            - output_transform.transform_point_in(Point::default(), &cursor_plane_size);
 
         let previous_state = self
             .pending_frame
@@ -3110,6 +3286,15 @@ where
             || previous_element_state
                 .map(|element_state| {
                     element_state.id != *element.id() || element.current_commit() != element_state.commit
+                })
+                .unwrap_or(true)
+            || previous_state
+                .plane_state(plane_info.handle)
+                .and_then(|state| {
+                    state
+                        .config
+                        .as_ref()
+                        .map(|config| config.properties.dst.size != cursor_plane_size)
                 })
                 .unwrap_or(true);
 
@@ -3160,8 +3345,8 @@ where
         // if we fail to create a buffer we can just return false and
         // force the cursor to be rendered on the primary plane
         let mut cursor_buffer = match cursor_state.allocator.create_buffer(
-            self.cursor_size.w as u32,
-            self.cursor_size.h as u32,
+            cursor_plane_size.w as u32,
+            cursor_plane_size.h as u32,
             DrmFourcc::Argb8888,
             &[DrmModifier::Linear],
         ) {
@@ -3195,23 +3380,14 @@ where
             }
         };
 
-        // Try to claim the plane, if this fails we can not use it
-        let plane_claim = match self.surface.claim_plane(plane_info.handle) {
-            Some(claim) => claim,
-            None => {
-                trace!("failed to claim {:?}", plane_info.handle);
-                return None;
-            }
-        };
-
-        let cursor_buffer_size = self.cursor_size.to_logical(1).to_buffer(1, Transform::Normal);
+        let cursor_buffer_size = cursor_plane_size.to_logical(1).to_buffer(1, Transform::Normal);
 
         #[cfg(not(feature = "renderer_pixman"))]
         if !copy_element_to_cursor_bo(
             renderer,
             element,
             element_size,
-            self.cursor_size,
+            cursor_plane_size,
             output_transform,
             &cursor_state.framebuffer_exporter,
             &mut cursor_buffer,
@@ -3225,7 +3401,7 @@ where
             renderer,
             element,
             element_size,
-            self.cursor_size,
+            cursor_plane_size,
             output_transform,
             &cursor_state.framebuffer_exporter,
             &mut cursor_buffer,
@@ -3296,10 +3472,10 @@ where
                         .map_err(|_| PixmanError::ImportFailed)?;
                         pixman_renderer.bind(PixmanRenderBuffer::from(cursor_dst))?;
 
-                        let mut frame = pixman_renderer.render(self.cursor_size, output_transform)?;
+                        let mut frame = pixman_renderer.render(cursor_plane_size, output_transform)?;
                         frame.clear(
-                            [0f32, 0f32, 0f32, 0f32],
-                            &[Rectangle::from_loc_and_size((0, 0), self.cursor_size)],
+                            Color32F::TRANSPARENT,
+                            &[Rectangle::from_loc_and_size((0, 0), cursor_plane_size)],
                         )?;
                         let src = element.src();
                         let dst = Rectangle::from_loc_and_size((0, 0), element_geometry.size);
@@ -3334,7 +3510,7 @@ where
         };
 
         let src = Rectangle::from_loc_and_size(Point::default(), cursor_buffer_size).to_f64();
-        let dst = Rectangle::from_loc_and_size(cursor_plane_location, self.cursor_size);
+        let dst = Rectangle::from_loc_and_size(cursor_plane_location, cursor_plane_size);
 
         let config = PlaneConfig {
             properties: PlaneProperties {
@@ -3568,14 +3744,20 @@ where
                         }
                         acc
                     });
-            let current_plane_snapshot = PlanesSnapshot {
-                primary: frame_state.is_assigned(self.planes.primary.handle),
-                cursor: self
-                    .planes
+            let cursor_bitmask =
+                self.planes
                     .cursor
-                    .as_ref()
-                    .map(|plane| frame_state.is_assigned(plane.handle))
-                    .unwrap_or(false),
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |mut acc, (index, plane)| {
+                        if frame_state.is_assigned(plane.handle) {
+                            acc |= 1 << index;
+                        }
+                        acc
+                    });
+            let current_plane_snapshot = PlanesSnapshot {
+                primary: frame_state.is_assigned(self.surface.plane()),
+                cursor_bitmask,
                 overlay_bitmask,
             };
 
@@ -3610,8 +3792,8 @@ where
                         let primary_plane_changed = current_plane_snapshot
                             .primary
                             .then(|| {
-                                frame_state.plane_properties(self.planes.primary.handle)
-                                    != previous_frame_state.plane_properties(self.planes.primary.handle)
+                                frame_state.plane_properties(self.surface.plane())
+                                    != previous_frame_state.plane_properties(self.surface.plane())
                             })
                             .unwrap_or(false);
 
@@ -3722,7 +3904,7 @@ where
         });
 
         let primary_plane_has_alpha = frame_state
-            .plane_buffer(self.planes.primary.handle)
+            .plane_buffer(self.surface.plane())
             .map(|state| has_alpha(state.format().code))
             .unwrap_or(false);
 
@@ -3776,7 +3958,8 @@ where
             }
 
             // test if the plane represents an underlay
-            let is_underlay = self.planes.primary.zpos.unwrap_or_default() > plane.zpos.unwrap_or_default();
+            let is_underlay =
+                self.surface.plane_info().zpos.unwrap_or_default() > plane.zpos.unwrap_or_default();
 
             if is_underlay && !(element_is_opaque && primary_plane_has_alpha) {
                 trace!(
@@ -3948,7 +4131,10 @@ where
             buffer: element_config.buffer.clone(),
             damage_clips,
             plane_claim,
-            sync: None,
+            sync: element_config
+                .buffer
+                .buffer
+                .acquire_point(self.signaled_fence.as_ref()),
         };
 
         let is_compatible = previous_state
@@ -4358,4 +4544,13 @@ impl<
             FrameError::FramebufferExport(err) => SwapBuffersError::ContextLost(Box::new(err)),
         }
     }
+}
+
+fn nvidia_drm_version() -> Option<(u32, u32, u32)> {
+    let ver = std::fs::read_to_string("/sys/module/nvidia_drm/version").ok()?;
+    let mut components = ver.trim().split('.');
+    let major = u32::from_str(components.next()?).ok()?;
+    let minor = u32::from_str(components.next()?).ok()?;
+    let patch = u32::from_str(components.next()?).ok()?;
+    Some((major, minor, patch))
 }

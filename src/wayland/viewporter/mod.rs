@@ -10,6 +10,9 @@
 //! ```
 //! use smithay::wayland::viewporter::ViewporterState;
 //! use smithay::delegate_viewporter;
+//! # use smithay::delegate_compositor;
+//! # use smithay::wayland::compositor::{CompositorHandler, CompositorState, CompositorClientState};
+//! # use smithay::reexports::wayland_server::{Client, protocol::wl_surface::WlSurface};
 //!
 //! # struct State;
 //! # let mut display = wayland_server::Display::<State>::new().unwrap();
@@ -22,6 +25,13 @@
 //! // implement Dispatch for the Viewporter types
 //! delegate_viewporter!(State);
 //!
+//! # impl CompositorHandler for State {
+//! #     fn compositor_state(&mut self) -> &mut CompositorState { unimplemented!() }
+//! #     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState { unimplemented!() }
+//! #     fn commit(&mut self, surface: &WlSurface) {}
+//! # }
+//! # delegate_compositor!(State);
+//!
 //! // You're now ready to go!
 //! ```
 //!
@@ -32,7 +42,7 @@
 //!
 //! ```no_compile
 //! let viewport = with_states(surface, |states| {
-//!     states.cached_state.current::<ViewportCachedState>();
+//!     states.cached_state.get::<ViewportCachedState>().current()
 //! });
 //! ```
 //!
@@ -43,7 +53,7 @@
 //! [`on_commit_buffer_handler`](crate::backend::renderer::utils::on_commit_buffer_handler)
 //! the implementation will already call [`ensure_viewport_valid`] for you.
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use tracing::trace;
 use wayland_protocols::wp::viewporter::server::{wp_viewport, wp_viewporter};
@@ -51,15 +61,17 @@ use wayland_server::{
     backend::GlobalId, protocol::wl_surface, Dispatch, DisplayHandle, GlobalDispatch, Resource, Weak,
 };
 
-use crate::utils::{Logical, Rectangle, Size};
+use crate::utils::{Client, Logical, Rectangle, Size};
 
-use super::compositor::{self, with_states, Cacheable, SurfaceData};
+use super::compositor::{self, with_states, Cacheable, CompositorHandler, SurfaceData};
 
 /// State of the wp_viewporter Global
 #[derive(Debug)]
 pub struct ViewporterState {
     global: GlobalId,
 }
+
+pub(crate) type ViewporterSurfaceState = Mutex<Option<ViewportMarker>>;
 
 impl ViewporterState {
     /// Create new [`wp_viewporter`] global.
@@ -122,8 +134,8 @@ where
                 let already_has_viewport = with_states(&surface, |states| {
                     states
                         .data_map
-                        .get::<RefCell<Option<ViewportMarker>>>()
-                        .map(|v| v.borrow().is_some())
+                        .get::<ViewporterSurfaceState>()
+                        .map(|v| v.lock().unwrap().is_some())
                         .unwrap_or(false)
                 });
 
@@ -144,7 +156,9 @@ where
                 let initial = with_states(&surface, |states| {
                     let inserted = states
                         .data_map
-                        .insert_if_missing(|| RefCell::new(Some(ViewportMarker(viewport.downgrade()))));
+                        .insert_if_missing_threadsafe::<ViewporterSurfaceState, _>(|| {
+                            Mutex::new(Some(ViewportMarker(viewport.downgrade())))
+                        });
 
                     // if we did not insert the marker it will be None as
                     // checked in already_has_viewport and we have to update
@@ -152,9 +166,10 @@ where
                     if !inserted {
                         *states
                             .data_map
-                            .get::<RefCell<Option<ViewportMarker>>>()
+                            .get::<ViewporterSurfaceState>()
                             .unwrap()
-                            .borrow_mut() = Some(ViewportMarker(viewport.downgrade()));
+                            .lock()
+                            .unwrap() = Some(ViewportMarker(viewport.downgrade()));
                     }
 
                     inserted
@@ -162,7 +177,7 @@ where
 
                 // only add the pre-commit hook once for the surface
                 if initial {
-                    compositor::add_pre_commit_hook::<D, _>(&surface, viewport_commit_hook);
+                    compositor::add_pre_commit_hook::<D, _>(&surface, viewport_pre_commit_hook);
                 }
             }
             wp_viewporter::Request::Destroy => {
@@ -178,10 +193,11 @@ where
     D: GlobalDispatch<wp_viewporter::WpViewporter, ()>,
     D: Dispatch<wp_viewporter::WpViewporter, ()>,
     D: Dispatch<wp_viewport::WpViewport, ViewportState>,
+    D: CompositorHandler,
 {
     fn request(
-        _state: &mut D,
-        _client: &wayland_server::Client,
+        state: &mut D,
+        client: &wayland_server::Client,
         resource: &wp_viewport::WpViewport,
         request: <wp_viewport::WpViewport as wayland_server::Resource>::Request,
         data: &ViewportState,
@@ -194,11 +210,12 @@ where
                     with_states(&surface, |states| {
                         states
                             .data_map
-                            .get::<RefCell<Option<ViewportMarker>>>()
+                            .get::<ViewporterSurfaceState>()
                             .unwrap()
-                            .borrow_mut()
+                            .lock()
+                            .unwrap()
                             .take();
-                        *states.cached_state.pending::<ViewportCachedState>() =
+                        *states.cached_state.get::<ViewportCachedState>().pending() =
                             ViewportCachedState::default();
                     });
                 }
@@ -229,7 +246,8 @@ where
                 };
 
                 with_states(&surface, |states| {
-                    let mut viewport_state = states.cached_state.pending::<ViewportCachedState>();
+                    let mut guard = states.cached_state.get::<ViewportCachedState>();
+                    let viewport_state = guard.pending();
                     let src = if is_unset {
                         None
                     } else {
@@ -266,11 +284,13 @@ where
                 };
 
                 with_states(&surface, |states| {
-                    let mut viewport_state = states.cached_state.pending::<ViewportCachedState>();
+                    let mut guard = states.cached_state.get::<ViewportCachedState>();
+                    let viewport_state = guard.pending();
                     let size = if is_unset {
                         None
                     } else {
-                        let dst = Size::from((width, height));
+                        let client_scale = state.client_compositor_state(client).client_scale();
+                        let dst = Size::<_, Client>::from((width, height)).to_logical(client_scale as i32);
                         trace!(surface = ?surface, size = ?dst, "setting surface viewport destination size");
                         Some(dst)
                     };
@@ -288,20 +308,26 @@ pub struct ViewportState {
     surface: Weak<wl_surface::WlSurface>,
 }
 
-struct ViewportMarker(Weak<wp_viewport::WpViewport>);
+pub(crate) struct ViewportMarker(Weak<wp_viewport::WpViewport>);
 
-fn viewport_commit_hook<D: 'static>(_state: &mut D, _dh: &DisplayHandle, surface: &wl_surface::WlSurface) {
+fn viewport_pre_commit_hook<D: 'static>(
+    _state: &mut D,
+    _dh: &DisplayHandle,
+    surface: &wl_surface::WlSurface,
+) {
     with_states(surface, |states| {
         states
             .data_map
-            .insert_if_missing(|| RefCell::new(Option::<ViewportMarker>::None));
+            .insert_if_missing_threadsafe::<ViewporterSurfaceState, _>(|| Mutex::new(None));
         let viewport = states
             .data_map
-            .get::<RefCell<Option<ViewportMarker>>>()
+            .get::<ViewporterSurfaceState>()
             .unwrap()
-            .borrow();
+            .lock()
+            .unwrap();
         if let Some(viewport) = &*viewport {
-            let viewport_state = states.cached_state.pending::<ViewportCachedState>();
+            let mut guard = states.cached_state.get::<ViewportCachedState>();
+            let viewport_state = guard.pending();
 
             // If src_width or src_height are not integers and destination size is not set,
             // the bad_size protocol error is raised when the surface state is applied.
@@ -327,15 +353,17 @@ fn viewport_commit_hook<D: 'static>(_state: &mut D, _dh: &DisplayHandle, surface
 pub fn ensure_viewport_valid(states: &SurfaceData, buffer_size: Size<i32, Logical>) -> bool {
     states
         .data_map
-        .insert_if_missing(|| RefCell::new(Option::<ViewportMarker>::None));
+        .insert_if_missing_threadsafe::<ViewporterSurfaceState, _>(|| Mutex::new(None));
     let viewport = states
         .data_map
-        .get::<RefCell<Option<ViewportMarker>>>()
+        .get::<ViewporterSurfaceState>()
         .unwrap()
-        .borrow();
+        .lock()
+        .unwrap();
 
     if let Some(viewport) = &*viewport {
-        let state = states.cached_state.pending::<ViewportCachedState>();
+        let mut guard = states.cached_state.get::<ViewportCachedState>();
+        let state = guard.pending();
 
         let buffer_rect = Rectangle::from_loc_and_size((0.0, 0.0), buffer_size.to_f64());
         let src = state.src.unwrap_or(buffer_rect);

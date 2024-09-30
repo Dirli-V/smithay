@@ -5,7 +5,7 @@ use crate::{
     backend::renderer::{
         damage::{Error as OutputDamageTrackerError, OutputDamageTracker, RenderOutputResult},
         element::{AsRenderElements, RenderElement, Wrap},
-        Renderer, Texture,
+        Color32F, Renderer, Texture,
     },
     output::{Output, OutputModeSource, OutputNoMode},
     utils::{IsAlive, Logical, Point, Rectangle, Scale, Transform},
@@ -32,7 +32,7 @@ pub use self::element::*;
 use self::output::*;
 pub use self::utils::*;
 
-crate::utils::ids::id_gen!(next_space_id, SPACE_ID, SPACE_IDS);
+crate::utils::ids::id_gen!(space_id);
 
 #[derive(Debug)]
 struct InnerElement<E> {
@@ -66,14 +66,14 @@ impl<E: SpaceElement> PartialEq for Space<E> {
 impl<E: SpaceElement> Drop for Space<E> {
     #[inline]
     fn drop(&mut self) {
-        SPACE_IDS.lock().unwrap().remove(&self.id);
+        space_id::remove(self.id);
     }
 }
 
 impl<E: SpaceElement> Default for Space<E> {
     #[inline]
     fn default() -> Self {
-        let id = next_space_id();
+        let id = space_id::next();
         let span = debug_span!("desktop_space", id);
 
         Self {
@@ -103,6 +103,7 @@ impl<E: SpaceElement + PartialEq> Space<E> {
     where
         P: Into<Point<i32, Logical>>,
     {
+        #[allow(clippy::mutable_key_type)]
         let outputs = if let Some(pos) = self.elements.iter().position(|inner| inner.element == element) {
             self.elements.remove(pos).outputs
         } else {
@@ -157,7 +158,7 @@ impl<E: SpaceElement + PartialEq> Space<E> {
     }
 
     /// Iterate elements in z-order back to front
-    pub fn elements(&self) -> impl DoubleEndedIterator<Item = &E> {
+    pub fn elements(&self) -> impl DoubleEndedIterator<Item = &E> + ExactSizeIterator {
         self.elements.iter().map(|e| &e.element)
     }
 
@@ -255,9 +256,8 @@ impl<E: SpaceElement + PartialEq> Space<E> {
     ///
     /// *Note:* Remapping an output does reset it's damage memory.
     pub fn map_output<P: Into<Point<i32, Logical>>>(&mut self, output: &Output, location: P) {
-        let mut state = output_state(self.id, output);
         let location = location.into();
-        *state = OutputState { location };
+        set_output_location(self.id, output, location);
         if !self.outputs.contains(output) {
             debug!(parent: &self.span, output = output.name(), "Mapping output at {:?}", location);
             self.outputs.push(output.clone());
@@ -277,9 +277,7 @@ impl<E: SpaceElement + PartialEq> Space<E> {
             return;
         }
         debug!(parent: &self.span, output = output.name(), "Unmapping output");
-        if let Some(map) = output.user_data().get::<OutputUserdata>() {
-            map.borrow_mut().remove(&self.id);
-        }
+        set_output_location(self.id, output, None);
         self.outputs.retain(|o| o != output);
     }
 
@@ -293,10 +291,10 @@ impl<E: SpaceElement + PartialEq> Space<E> {
         }
 
         let transform: Transform = o.current_transform();
-        let state = output_state(self.id, o);
+        let location = output_location(self.id, o);
         o.current_mode().map(|mode| {
             Rectangle::from_loc_and_size(
-                state.location,
+                location,
                 transform
                     .transform_size(mode.size)
                     .to_f64()
@@ -684,7 +682,7 @@ pub fn render_output<
     spaces: S,
     custom_elements: &'a [C],
     damage_tracker: &'d mut OutputDamageTracker,
-    clear_color: [f32; 4],
+    clear_color: impl Into<Color32F>,
 ) -> Result<RenderOutputResult<'d>, OutputDamageTrackerError<R>>
 where
     <R as Renderer>::TextureId: Clone + Texture + 'static,

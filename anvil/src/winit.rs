@@ -126,7 +126,7 @@ pub fn run_winit() {
 
     #[cfg(feature = "debug")]
     let fps_image =
-        image::io::Reader::with_format(std::io::Cursor::new(FPS_NUMBERS_PNG), image::ImageFormat::Png)
+        image::ImageReader::with_format(std::io::Cursor::new(FPS_NUMBERS_PNG), image::ImageFormat::Png)
             .decode()
             .unwrap();
     #[cfg(feature = "debug")]
@@ -147,7 +147,7 @@ pub fn run_winit() {
 
     let dmabuf_default_feedback = match render_node {
         Ok(Some(node)) => {
-            let dmabuf_formats = backend.renderer().dmabuf_formats().collect::<Vec<_>>();
+            let dmabuf_formats = backend.renderer().dmabuf_formats();
             let dmabuf_default_feedback = DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats)
                 .build()
                 .unwrap();
@@ -173,7 +173,7 @@ pub fn run_winit() {
         );
         (dmabuf_state, dmabuf_global, Some(default_feedback))
     } else {
-        let dmabuf_formats = backend.renderer().dmabuf_formats().collect::<Vec<_>>();
+        let dmabuf_formats = backend.renderer().dmabuf_formats();
         let mut dmabuf_state = DmabufState::new();
         let dmabuf_global =
             dmabuf_state.create_global::<AnvilState<WinitData>>(&display.handle(), dmabuf_formats);
@@ -277,8 +277,7 @@ pub fn run_winit() {
             } else {
                 (0, 0).into()
             };
-            let cursor_pos = state.pointer.current_location() - cursor_hotspot.to_f64();
-            let cursor_pos_scaled = cursor_pos.to_physical(scale).to_i32_round();
+            let cursor_pos = state.pointer.current_location();
 
             #[cfg(feature = "debug")]
             let mut renderdoc = state.renderdoc.as_mut();
@@ -310,15 +309,27 @@ pub fn run_winit() {
 
                 let mut elements = Vec::<CustomRenderElements<GlesRenderer>>::new();
 
-                elements.extend(pointer_element.render_elements(renderer, cursor_pos_scaled, scale, 1.0));
+                elements.extend(
+                    pointer_element.render_elements(
+                        renderer,
+                        (cursor_pos - cursor_hotspot.to_f64())
+                            .to_physical(scale)
+                            .to_i32_round(),
+                        scale,
+                        1.0,
+                    ),
+                );
 
                 // draw the dnd icon if any
-                if let Some(surface) = dnd_icon {
-                    if surface.alive() {
+                if let Some(icon) = dnd_icon {
+                    let dnd_icon_pos = (cursor_pos + icon.offset.to_f64())
+                        .to_physical(scale)
+                        .to_i32_round();
+                    if icon.surface.alive() {
                         elements.extend(AsRenderElements::<GlesRenderer>::render_elements(
-                            &smithay::desktop::space::SurfaceTree::from_surface(surface),
+                            &smithay::desktop::space::SurfaceTree::from_surface(&icon.surface),
                             renderer,
-                            cursor_pos_scaled,
+                            dnd_icon_pos,
                             scale,
                             1.0,
                         ));

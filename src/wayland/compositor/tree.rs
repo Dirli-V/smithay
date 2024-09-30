@@ -1,9 +1,14 @@
-use crate::{utils::Serial, wayland::compositor::SUBSURFACE_ROLE};
+use crate::{
+    utils::{
+        hook::{Hook, HookId},
+        Serial,
+    },
+    wayland::compositor::SUBSURFACE_ROLE,
+};
 
 use super::{
     cache::MultiCache,
     handlers::{is_effectively_sync, SurfaceUserData},
-    hook::{Hook, HookId},
     transaction::{Blocker, PendingTransaction, TransactionQueue},
     BufferAssignment, CompositorHandler, SurfaceAttributes, SurfaceData,
 };
@@ -138,27 +143,17 @@ impl PrivateSurfaceData {
             let mut child_guard = child_mutex.lock().unwrap();
             child_guard.parent = None;
         }
-        if let Some(BufferAssignment::NewBuffer(buffer)) = my_data
-            .public_data
-            .cached_state
-            .current::<SurfaceAttributes>()
-            .buffer
-            .take()
-        {
+        let mut guard = my_data.public_data.cached_state.get::<SurfaceAttributes>();
+        if let Some(BufferAssignment::NewBuffer(buffer)) = guard.current().buffer.take() {
             buffer.release();
         };
-        if let Some(BufferAssignment::NewBuffer(buffer)) = my_data
-            .public_data
-            .cached_state
-            .pending::<SurfaceAttributes>()
-            .buffer
-            .take()
-        {
+        if let Some(BufferAssignment::NewBuffer(buffer)) = guard.pending().buffer.take() {
             buffer.release();
         };
 
         let hooks = my_data.destruction_hooks.clone();
         // don't hold the mutex while the hooks are invoked
+        drop(guard);
         drop(my_data);
         for hook in hooks {
             (hook.cb)(state, surface)

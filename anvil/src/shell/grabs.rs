@@ -35,7 +35,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
         &mut self,
         data: &mut AnvilState<BackendData>,
         handle: &mut PointerInnerHandle<'_, AnvilState<BackendData>>,
-        _focus: Option<(PointerFocusTarget, Point<i32, Logical>)>,
+        _focus: Option<(PointerFocusTarget, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
         // While the grab is active, no client has pointer focus
@@ -52,7 +52,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerMoveS
         &mut self,
         data: &mut AnvilState<BackendData>,
         handle: &mut PointerInnerHandle<'_, AnvilState<BackendData>>,
-        focus: Option<(PointerFocusTarget, Point<i32, Logical>)>,
+        focus: Option<(PointerFocusTarget, Point<f64, Logical>)>,
         event: &RelativeMotionEvent,
     ) {
         handle.relative_motion(data, focus, event);
@@ -180,7 +180,7 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
         _handle: &mut smithay::input::touch::TouchInnerHandle<'_, AnvilState<BackendData>>,
         _focus: Option<(
             <AnvilState<BackendData> as smithay::input::SeatHandler>::TouchFocus,
-            Point<i32, Logical>,
+            Point<f64, Logical>,
         )>,
         _event: &smithay::input::touch::DownEvent,
         _seq: Serial,
@@ -208,7 +208,7 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchMoveSurfa
         _handle: &mut smithay::input::touch::TouchInnerHandle<'_, AnvilState<BackendData>>,
         _focus: Option<(
             <AnvilState<BackendData> as smithay::input::SeatHandler>::TouchFocus,
-            Point<i32, Logical>,
+            Point<f64, Logical>,
         )>,
         event: &smithay::input::touch::MotionEvent,
         _seq: Serial,
@@ -353,7 +353,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
         &mut self,
         data: &mut AnvilState<BackendData>,
         handle: &mut PointerInnerHandle<'_, AnvilState<BackendData>>,
-        _focus: Option<(PointerFocusTarget, Point<i32, Logical>)>,
+        _focus: Option<(PointerFocusTarget, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
         // While the grab is active, no client has pointer focus
@@ -391,7 +391,8 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
 
         let (min_size, max_size) = if let Some(surface) = self.window.wl_surface() {
             with_states(&surface, |states| {
-                let data = states.cached_state.current::<SurfaceCachedState>();
+                let mut guard = states.cached_state.get::<SurfaceCachedState>();
+                let data = guard.current();
                 (data.min_size, data.max_size)
             })
         } else {
@@ -400,16 +401,8 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
 
         let min_width = min_size.w.max(1);
         let min_height = min_size.h.max(1);
-        let max_width = if max_size.w == 0 {
-            i32::max_value()
-        } else {
-            max_size.w
-        };
-        let max_height = if max_size.h == 0 {
-            i32::max_value()
-        } else {
-            max_size.h
-        };
+        let max_width = if max_size.w == 0 { i32::MAX } else { max_size.w };
+        let max_height = if max_size.h == 0 { i32::MAX } else { max_size.h };
 
         new_window_width = new_window_width.max(min_width).min(max_width);
         new_window_height = new_window_height.max(min_height).min(max_height);
@@ -437,7 +430,7 @@ impl<BackendData: Backend> PointerGrab<AnvilState<BackendData>> for PointerResiz
         &mut self,
         data: &mut AnvilState<BackendData>,
         handle: &mut PointerInnerHandle<'_, AnvilState<BackendData>>,
-        focus: Option<(PointerFocusTarget, Point<i32, Logical>)>,
+        focus: Option<(PointerFocusTarget, Point<f64, Logical>)>,
         event: &RelativeMotionEvent,
     ) {
         handle.relative_motion(data, focus, event);
@@ -648,7 +641,7 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
         _handle: &mut smithay::input::touch::TouchInnerHandle<'_, AnvilState<BackendData>>,
         _focus: Option<(
             <AnvilState<BackendData> as smithay::input::SeatHandler>::TouchFocus,
-            Point<i32, Logical>,
+            Point<f64, Logical>,
         )>,
         _event: &smithay::input::touch::DownEvent,
         _seq: Serial,
@@ -754,7 +747,7 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
         handle: &mut smithay::input::touch::TouchInnerHandle<'_, AnvilState<BackendData>>,
         _focus: Option<(
             <AnvilState<BackendData> as smithay::input::SeatHandler>::TouchFocus,
-            Point<i32, Logical>,
+            Point<f64, Logical>,
         )>,
         event: &smithay::input::touch::MotionEvent,
         _seq: Serial,
@@ -795,7 +788,8 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
 
         let (min_size, max_size) = if let Some(surface) = self.window.wl_surface() {
             with_states(&surface, |states| {
-                let data = states.cached_state.current::<SurfaceCachedState>();
+                let mut guard = states.cached_state.get::<SurfaceCachedState>();
+                let data = guard.current();
                 (data.min_size, data.max_size)
             })
         } else {
@@ -804,16 +798,8 @@ impl<BackendData: Backend> TouchGrab<AnvilState<BackendData>> for TouchResizeSur
 
         let min_width = min_size.w.max(1);
         let min_height = min_size.h.max(1);
-        let max_width = if max_size.w == 0 {
-            i32::max_value()
-        } else {
-            max_size.w
-        };
-        let max_height = if max_size.h == 0 {
-            i32::max_value()
-        } else {
-            max_size.h
-        };
+        let max_width = if max_size.w == 0 { i32::MAX } else { max_size.w };
+        let max_height = if max_size.h == 0 { i32::MAX } else { max_size.h };
 
         new_window_width = new_window_width.max(min_width).min(max_width);
         new_window_height = new_window_height.max(min_height).min(max_height);

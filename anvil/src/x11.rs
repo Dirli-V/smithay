@@ -35,7 +35,7 @@ use smithay::{
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
-        ash::vk::ExtPhysicalDeviceDrmFn,
+        ash::ext,
         calloop::EventLoop,
         gbm,
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
@@ -132,7 +132,7 @@ pub fn run_x11() {
             .and_then(|instance| {
                 PhysicalDevice::enumerate(&instance).ok().and_then(|devices| {
                     devices
-                        .filter(|phd| phd.has_device_extension(ExtPhysicalDeviceDrmFn::name()))
+                        .filter(|phd| phd.has_device_extension(ext::physical_device_drm::NAME))
                         .find(|phd| {
                             phd.primary_node().unwrap() == Some(node)
                                 || phd.render_node().unwrap() == Some(node)
@@ -182,7 +182,7 @@ pub fn run_x11() {
         info!("EGL hardware-acceleration enabled");
     }
 
-    let dmabuf_formats = renderer.dmabuf_formats().collect::<Vec<_>>();
+    let dmabuf_formats = renderer.dmabuf_formats();
     let dmabuf_default_feedback = DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats)
         .build()
         .unwrap();
@@ -205,7 +205,7 @@ pub fn run_x11() {
 
     #[cfg(feature = "debug")]
     let fps_image =
-        image::io::Reader::with_format(std::io::Cursor::new(FPS_NUMBERS_PNG), image::ImageFormat::Png)
+        image::ImageReader::with_format(std::io::Cursor::new(FPS_NUMBERS_PNG), image::ImageFormat::Png)
             .decode()
             .unwrap();
     #[cfg(feature = "debug")]
@@ -346,24 +346,30 @@ pub fn run_x11() {
             } else {
                 (0, 0).into()
             };
-            let cursor_pos = state.pointer.current_location() - cursor_hotspot.to_f64();
-            let cursor_pos_scaled = cursor_pos.to_physical(scale).to_i32_round();
+            let cursor_pos = state.pointer.current_location();
 
             pointer_element.set_status(state.cursor_status.clone());
-            elements.extend(pointer_element.render_elements(
-                &mut backend_data.renderer,
-                cursor_pos_scaled,
-                scale,
-                1.0,
-            ));
+            elements.extend(
+                pointer_element.render_elements(
+                    &mut backend_data.renderer,
+                    (cursor_pos - cursor_hotspot.to_f64())
+                        .to_physical(scale)
+                        .to_i32_round(),
+                    scale,
+                    1.0,
+                ),
+            );
 
             // draw the dnd icon if any
-            if let Some(surface) = state.dnd_icon.as_ref() {
-                if surface.alive() {
+            if let Some(icon) = state.dnd_icon.as_ref() {
+                let dnd_icon_pos = (cursor_pos + icon.offset.to_f64())
+                    .to_physical(scale)
+                    .to_i32_round();
+                if icon.surface.alive() {
                     elements.extend(AsRenderElements::<GlesRenderer>::render_elements(
-                        &smithay::desktop::space::SurfaceTree::from_surface(surface),
+                        &smithay::desktop::space::SurfaceTree::from_surface(&icon.surface),
                         &mut backend_data.renderer,
-                        cursor_pos_scaled,
+                        dnd_icon_pos,
                         scale,
                         1.0,
                     ));

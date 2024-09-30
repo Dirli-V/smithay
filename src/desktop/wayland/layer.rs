@@ -19,15 +19,14 @@ use wayland_server::protocol::wl_surface::{self, WlSurface};
 
 use std::{
     borrow::Cow,
-    cell::{RefCell, RefMut},
     hash::{Hash, Hasher},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
 use crate::desktop::WindowSurfaceType;
 
-crate::utils::ids::id_gen!(next_layer_id, LAYER_ID, LAYER_IDS);
+crate::utils::ids::id_gen!(layer_id);
 
 /// Map of [`LayerSurface`]s on an [`Output`]
 #[derive(Debug)]
@@ -42,14 +41,14 @@ pub struct LayerMap {
 /// If none existed before a new empty [`LayerMap`] is attached
 /// to the output and returned on subsequent calls.
 ///
-/// Note: This function internally uses a [`RefCell`] per
+/// Note: This function internally uses a [`Mutex`] per
 /// [`Output`] as exposed by its return type. Therefor
 /// trying to hold on to multiple references of a [`LayerMap`]
-/// of the same output using this function *will* result in a panic.
-pub fn layer_map_for_output(o: &Output) -> RefMut<'_, LayerMap> {
+/// of the same output using this function *will* result in a deadlock.
+pub fn layer_map_for_output(o: &Output) -> MutexGuard<'_, LayerMap> {
     let userdata = o.user_data();
-    userdata.insert_if_missing(|| {
-        RefCell::new(LayerMap {
+    userdata.insert_if_missing_threadsafe(|| {
+        Mutex::new(LayerMap {
             layers: IndexSet::new(),
             output: o.downgrade(),
             zone: Rectangle::from_loc_and_size(
@@ -67,7 +66,7 @@ pub fn layer_map_for_output(o: &Output) -> RefMut<'_, LayerMap> {
             ),
         })
     });
-    userdata.get::<RefCell<LayerMap>>().unwrap().borrow_mut()
+    userdata.get::<Mutex<LayerMap>>().unwrap().lock().unwrap()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -84,7 +83,7 @@ impl LayerMap {
                 .0
                 .userdata
                 .get::<LayerUserdata>()
-                .map(|s| s.borrow().is_some())
+                .map(|s| s.lock().unwrap().location.is_some())
                 .unwrap_or(false)
             {
                 return Err(LayerError::AlreadyMapped);
@@ -99,7 +98,14 @@ impl LayerMap {
     /// Remove a [`LayerSurface`] from this [`LayerMap`].
     pub fn unmap_layer(&mut self, layer: &LayerSurface) {
         if self.layers.shift_remove(layer) {
-            let _ = layer.user_data().get::<LayerUserdata>().take();
+            let _ = layer
+                .user_data()
+                .get::<LayerUserdata>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .location
+                .take();
             self.arrange();
         }
         if let (Some(output), surface) = (self.output(), layer.wl_surface()) {
@@ -142,7 +148,7 @@ impl LayerMap {
         }
         let mut bbox = layer.bbox();
         let state = layer_state(layer);
-        bbox.loc += state.location;
+        bbox.loc += state.location.unwrap_or_default();
         Some(bbox)
     }
 
@@ -157,7 +163,7 @@ impl LayerMap {
             let bbox_with_popups = {
                 let mut bbox = l.bbox_with_popups();
                 let state = layer_state(l);
-                bbox.loc += state.location;
+                bbox.loc += state.location.unwrap_or_default();
                 bbox
             };
             bbox_with_popups.to_f64().contains(point)
@@ -289,7 +295,7 @@ impl LayerMap {
                 }
 
                 let data = with_states(surface, |states| {
-                    *states.cached_state.current::<LayerSurfaceCachedState>()
+                    *states.cached_state.get::<LayerSurfaceCachedState>().current()
                 });
 
                 let mut source = match data.exclusive_zone {
@@ -416,8 +422,8 @@ impl LayerMap {
 
                 {
                     let mut layer_state = layer_state(layer);
-                    if layer_state.location != location {
-                        layer_state.location = location;
+                    if layer_state.location != Some(location) {
+                        layer_state.location = Some(location);
                         changed = true;
                     }
                 }
@@ -452,21 +458,16 @@ impl LayerMap {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct LayerState {
-    pub location: Point<i32, Logical>,
+    pub location: Option<Point<i32, Logical>>,
 }
 
-type LayerUserdata = RefCell<Option<LayerState>>;
-pub fn layer_state(layer: &LayerSurface) -> RefMut<'_, LayerState> {
+type LayerUserdata = Mutex<LayerState>;
+pub fn layer_state(layer: &LayerSurface) -> MutexGuard<'_, LayerState> {
     let userdata = layer.user_data();
-    userdata.insert_if_missing(LayerUserdata::default);
-    RefMut::map(userdata.get::<LayerUserdata>().unwrap().borrow_mut(), |opt| {
-        if opt.is_none() {
-            *opt = Some(LayerState::default());
-        }
-        opt.as_mut().unwrap()
-    })
+    userdata.insert_if_missing_threadsafe(LayerUserdata::default);
+    userdata.get::<LayerUserdata>().unwrap().lock().unwrap()
 }
 
 /// A [`LayerSurface`] represents a single layer surface as given by the wlr-layer-shell protocol.
@@ -500,7 +501,7 @@ pub(crate) struct LayerSurfaceInner {
 impl Drop for LayerSurfaceInner {
     #[inline]
     fn drop(&mut self) {
-        LAYER_IDS.lock().unwrap().remove(&self.id);
+        layer_id::remove(self.id);
     }
 }
 
@@ -515,7 +516,7 @@ impl LayerSurface {
     /// Create a new [`LayerSurface`] from a given [`WlrLayerSurface`] and its namespace.
     pub fn new(surface: WlrLayerSurface, namespace: String) -> LayerSurface {
         LayerSurface(Arc::new(LayerSurfaceInner {
-            id: next_layer_id(),
+            id: layer_id::next(),
             surface,
             namespace,
             userdata: UserDataMap::new(),
@@ -536,7 +537,7 @@ impl LayerSurface {
     /// Returns the cached protocol state
     pub fn cached_state(&self) -> LayerSurfaceCachedState {
         with_states(self.0.surface.wl_surface(), |states| {
-            *states.cached_state.current::<LayerSurfaceCachedState>()
+            *states.cached_state.get::<LayerSurfaceCachedState>().current()
         })
     }
 
@@ -545,7 +546,8 @@ impl LayerSurface {
         with_states(self.0.surface.wl_surface(), |states| {
             match states
                 .cached_state
-                .current::<LayerSurfaceCachedState>()
+                .get::<LayerSurfaceCachedState>()
+                .current()
                 .keyboard_interactivity
             {
                 KeyboardInteractivity::Exclusive | KeyboardInteractivity::OnDemand => true,
@@ -557,7 +559,11 @@ impl LayerSurface {
     /// Returns the layer this surface resides on, if any yet.
     pub fn layer(&self) -> WlrLayer {
         with_states(self.0.surface.wl_surface(), |states| {
-            states.cached_state.current::<LayerSurfaceCachedState>().layer
+            states
+                .cached_state
+                .get::<LayerSurfaceCachedState>()
+                .current()
+                .layer
         })
     }
 
@@ -579,7 +585,8 @@ impl LayerSurface {
         let mut bounding_box = self.bbox();
         let surface = self.0.surface.wl_surface();
         for (popup, location) in PopupManager::popups_for_surface(surface) {
-            bounding_box = bounding_box.merge(bbox_from_surface_tree(popup.wl_surface(), location));
+            let offset = location - popup.geometry().loc;
+            bounding_box = bounding_box.merge(bbox_from_surface_tree(popup.wl_surface(), offset));
         }
 
         bounding_box
@@ -599,7 +606,8 @@ impl LayerSurface {
         if surface_type.contains(WindowSurfaceType::POPUP) {
             for (popup, location) in PopupManager::popups_for_surface(surface) {
                 let surface = popup.wl_surface();
-                if let Some(result) = under_from_surface_tree(surface, point, location, surface_type) {
+                let offset = location - popup.geometry().loc;
+                if let Some(result) = under_from_surface_tree(surface, point, offset, surface_type) {
                     return Some(result);
                 }
             }

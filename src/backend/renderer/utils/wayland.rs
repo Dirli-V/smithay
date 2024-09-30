@@ -1,3 +1,5 @@
+#[cfg(feature = "backend_drm")]
+use crate::wayland::drm_syncobj::{DrmSyncPoint, DrmSyncobjCachedState};
 use crate::{
     backend::renderer::{buffer_dimensions, buffer_has_alpha, element::RenderElement, ImportAll, Renderer},
     utils::{Buffer as BufferCoord, Coordinate, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
@@ -13,8 +15,8 @@ use crate::{
 use std::sync::Arc;
 use std::{
     any::TypeId,
-    cell::RefCell,
     collections::{hash_map::Entry, HashMap},
+    sync::Mutex,
 };
 use tracing::{error, instrument, warn};
 
@@ -29,7 +31,7 @@ use super::{CommitCounter, DamageBag, DamageSet, SurfaceView};
 ///     let data = states.data_map.get::<RendererSurfaceStateUserData>();
 /// });
 /// ```
-pub type RendererSurfaceStateUserData = RefCell<RendererSurfaceState>;
+pub type RendererSurfaceStateUserData = Mutex<RendererSurfaceState>;
 
 /// Surface state for rendering related data
 #[derive(Default, Debug)]
@@ -37,7 +39,6 @@ pub struct RendererSurfaceState {
     pub(crate) buffer_dimensions: Option<Size<i32, BufferCoord>>,
     pub(crate) buffer_scale: i32,
     pub(crate) buffer_transform: Transform,
-    pub(crate) buffer_delta: Option<Point<i32, Logical>>,
     pub(crate) buffer_has_alpha: Option<bool>,
     pub(crate) buffer: Option<Buffer>,
     pub(crate) damage: DamageBag<i32, BufferCoord>,
@@ -45,17 +46,33 @@ pub struct RendererSurfaceState {
     pub(crate) textures: HashMap<(TypeId, usize), Box<dyn std::any::Any>>,
     pub(crate) surface_view: Option<SurfaceView>,
     pub(crate) opaque_regions: Vec<Rectangle<i32, Logical>>,
-
-    accumulated_buffer_delta: Point<i32, Logical>,
 }
 
+// SAFETY: Only thing unsafe here is the `Box<dyn std::any::Any>`, which are the textures.
+// Those are guarded by our Renderers handling thread-safety and the TypeId+render-id.
+// Theoretically a renderer could be thread-safe, but it's texture type isn't, but that is **very** theoretical.
+unsafe impl Send for RendererSurfaceState {}
+unsafe impl Sync for RendererSurfaceState {}
+
 #[derive(Debug)]
-struct InnerBuffer(WlBuffer);
+struct InnerBuffer {
+    buffer: WlBuffer,
+    #[cfg(feature = "backend_drm")]
+    acquire_point: Option<DrmSyncPoint>,
+    #[cfg(feature = "backend_drm")]
+    release_point: Option<DrmSyncPoint>,
+}
 
 impl Drop for InnerBuffer {
     #[inline]
     fn drop(&mut self) {
-        self.0.release();
+        self.buffer.release();
+        #[cfg(feature = "backend_drm")]
+        if let Some(release_point) = &self.release_point {
+            if let Err(err) = release_point.signal() {
+                tracing::error!("Failed to signal syncobj release point: {}", err);
+            }
+        }
     }
 }
 
@@ -65,12 +82,36 @@ pub struct Buffer {
     inner: Arc<InnerBuffer>,
 }
 
-impl From<WlBuffer> for Buffer {
-    #[inline]
-    fn from(buffer: WlBuffer) -> Self {
-        Buffer {
-            inner: Arc::new(InnerBuffer(buffer)),
+impl Buffer {
+    /// Create a buffer with implicit sync
+    pub fn with_implicit(buffer: WlBuffer) -> Self {
+        Self {
+            inner: Arc::new(InnerBuffer {
+                buffer,
+                #[cfg(feature = "backend_drm")]
+                acquire_point: None,
+                #[cfg(feature = "backend_drm")]
+                release_point: None,
+            }),
         }
+    }
+
+    /// Create a buffer with explicit acquire and release sync points
+    #[cfg(feature = "backend_drm")]
+    pub fn with_explicit(buffer: WlBuffer, acquire_point: DrmSyncPoint, release_point: DrmSyncPoint) -> Self {
+        Self {
+            inner: Arc::new(InnerBuffer {
+                buffer,
+                acquire_point: Some(acquire_point),
+                release_point: Some(release_point),
+            }),
+        }
+    }
+
+    #[cfg(feature = "backend_drm")]
+    #[allow(dead_code)]
+    pub(crate) fn acquire_point(&self) -> Option<&DrmSyncPoint> {
+        self.inner.acquire_point.as_ref()
     }
 }
 
@@ -79,33 +120,34 @@ impl std::ops::Deref for Buffer {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.inner.0
+        &self.inner.buffer
     }
 }
 
 impl PartialEq<WlBuffer> for Buffer {
     #[inline]
     fn eq(&self, other: &WlBuffer) -> bool {
-        self.inner.0 == *other
+        self.inner.buffer == *other
     }
 }
 
 impl PartialEq<WlBuffer> for &Buffer {
     #[inline]
     fn eq(&self, other: &WlBuffer) -> bool {
-        self.inner.0 == *other
+        self.inner.buffer == *other
     }
 }
 
 impl RendererSurfaceState {
     #[profiling::function]
     pub(crate) fn update_buffer(&mut self, states: &SurfaceData) {
-        let mut attrs = states.cached_state.current::<SurfaceAttributes>();
-        self.buffer_delta = attrs.buffer_delta.take();
+        #[cfg(feature = "backend_drm")]
+        let mut guard = states.cached_state.get::<DrmSyncobjCachedState>();
+        #[cfg(feature = "backend_drm")]
+        let syncobj_state = guard.current();
 
-        if let Some(delta) = self.buffer_delta {
-            self.accumulated_buffer_delta += delta;
-        }
+        let mut guard = states.cached_state.get::<SurfaceAttributes>();
+        let attrs = guard.current();
 
         let new_buffer = matches!(attrs.buffer, Some(BufferAssignment::NewBuffer(_)));
         match attrs.buffer.take() {
@@ -122,7 +164,15 @@ impl RendererSurfaceState {
                 self.buffer_transform = attrs.buffer_transform.into();
 
                 if !self.buffer.as_ref().map_or(false, |b| b == buffer) {
-                    self.buffer = Some(Buffer::from(buffer));
+                    self.buffer = Some(Buffer {
+                        inner: Arc::new(InnerBuffer {
+                            buffer,
+                            #[cfg(feature = "backend_drm")]
+                            acquire_point: syncobj_state.acquire_point.take(),
+                            #[cfg(feature = "backend_drm")]
+                            release_point: syncobj_state.release_point.take(),
+                        }),
+                    });
                 }
 
                 self.textures.clear();
@@ -140,7 +190,7 @@ impl RendererSurfaceState {
         };
 
         let surface_size = buffer_dimensions.to_logical(self.buffer_scale, self.buffer_transform);
-        let surface_view = SurfaceView::from_states(states, surface_size, self.accumulated_buffer_delta);
+        let surface_view = SurfaceView::from_states(states, surface_size, attrs.client_scale);
         let surface_view_changed = self.surface_view.replace(surface_view) != Some(surface_view);
 
         // if we received a new buffer also process the attached damage
@@ -278,16 +328,6 @@ impl RendererSurfaceState {
         self.textures.get(&texture_id).and_then(|e| e.downcast_ref())
     }
 
-    /// Location of the buffer relative to the previous call of take_accumulated_buffer_delta
-    ///
-    /// In other words, the x and y, combined with the new surface size define in which directions
-    /// the surface's size changed since last call to this method.
-    ///
-    /// Once delta is taken this method returns `None` to avoid processing it several times.
-    pub fn take_accumulated_buffer_delta(&mut self) -> Point<i32, Logical> {
-        std::mem::take(&mut self.accumulated_buffer_delta)
-    }
-
     /// Gets the opaque regions of this surface
     pub fn opaque_regions(&self) -> Option<&[Rectangle<i32, Logical>]> {
         // If the surface is unmapped there can be no opaque regions
@@ -339,7 +379,7 @@ pub fn on_commit_buffer_handler<D: 'static>(surface: &WlSurface) {
             |surf, states, _| {
                 if states
                     .data_map
-                    .insert_if_missing(|| RefCell::new(RendererSurfaceState::default()))
+                    .insert_if_missing_threadsafe(|| Mutex::new(RendererSurfaceState::default()))
                 {
                     new_surfaces.push(surf.clone());
                 }
@@ -347,7 +387,8 @@ pub fn on_commit_buffer_handler<D: 'static>(surface: &WlSurface) {
                     .data_map
                     .get::<RendererSurfaceStateUserData>()
                     .unwrap()
-                    .borrow_mut();
+                    .lock()
+                    .unwrap();
                 data.update_buffer(states);
             },
             |_, _, _| true,
@@ -362,7 +403,7 @@ pub fn on_commit_buffer_handler<D: 'static>(surface: &WlSurface) {
                     if let Some(mut state) = data
                         .data_map
                         .get::<RendererSurfaceStateUserData>()
-                        .map(|s| s.borrow_mut())
+                        .map(|s| s.lock().unwrap())
                     {
                         state.reset();
                     }
@@ -373,23 +414,26 @@ pub fn on_commit_buffer_handler<D: 'static>(surface: &WlSurface) {
 }
 
 impl SurfaceView {
-    fn from_states(
-        states: &SurfaceData,
-        surface_size: Size<i32, Logical>,
-        buffer_delta: Point<i32, Logical>,
-    ) -> SurfaceView {
+    fn from_states(states: &SurfaceData, surface_size: Size<i32, Logical>, client_scale: u32) -> SurfaceView {
         viewporter::ensure_viewport_valid(states, surface_size);
-        let viewport = states.cached_state.current::<viewporter::ViewportCachedState>();
+        let mut viewport_state = states.cached_state.get::<viewporter::ViewportCachedState>();
+        let viewport = viewport_state.current();
+
         let src = viewport
             .src
             .unwrap_or_else(|| Rectangle::from_loc_and_size((0.0, 0.0), surface_size.to_f64()));
-        let dst = viewport.size().unwrap_or(surface_size);
-        let mut offset = if states.role == Some("subsurface") {
-            states.cached_state.current::<SubsurfaceCachedState>().location
+        let dst = viewport
+            .size()
+            .unwrap_or(surface_size.to_client(1).to_logical(client_scale as i32));
+        let offset = if states.role == Some("subsurface") {
+            states
+                .cached_state
+                .get::<SubsurfaceCachedState>()
+                .current()
+                .location
         } else {
             Default::default()
         };
-        offset += buffer_delta;
         SurfaceView { src, dst, offset }
     }
 
@@ -432,7 +476,7 @@ where
 {
     compositor::with_states(surface, |states| {
         let data = states.data_map.get::<RendererSurfaceStateUserData>()?;
-        Some(cb(&mut data.borrow_mut()))
+        Some(cb(&mut data.lock().unwrap()))
     })
 }
 
@@ -452,13 +496,21 @@ where
 {
     if let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() {
         let texture_id = (TypeId::of::<<R as Renderer>::TextureId>(), renderer.id());
-        let mut data_ref = data.borrow_mut();
+        let mut data_ref = data.lock().unwrap();
         let data = &mut *data_ref;
 
         let last_commit = data.renderer_seen.get(&texture_id);
         let buffer_damage = data.damage_since(last_commit.copied());
         if let Entry::Vacant(e) = data.textures.entry(texture_id) {
             if let Some(buffer) = data.buffer.as_ref() {
+                // There is no point in importing a single pixel buffer
+                if matches!(
+                    crate::backend::renderer::buffer_type(buffer),
+                    Some(crate::backend::renderer::BufferType::SinglePixel)
+                ) {
+                    return Ok(());
+                }
+
                 match renderer.import_buffer(buffer, Some(states), &buffer_damage) {
                     Some(Ok(m)) => {
                         e.insert(Box::new(m));
@@ -509,7 +561,7 @@ where
             }
 
             if let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() {
-                let mut data_ref = data.borrow_mut();
+                let mut data_ref = data.lock().unwrap();
                 let data = &mut *data_ref;
                 // Now, should we be drawn ?
                 if data.textures.contains_key(&texture_id) {

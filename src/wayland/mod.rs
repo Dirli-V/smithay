@@ -53,6 +53,9 @@ pub mod cursor_shape;
 pub mod dmabuf;
 #[cfg(feature = "backend_drm")]
 pub mod drm_lease;
+#[cfg(feature = "backend_drm")]
+pub mod drm_syncobj;
+pub mod foreign_toplevel_list;
 pub mod fractional_scale;
 pub mod idle_inhibit;
 pub mod idle_notify;
@@ -69,6 +72,7 @@ pub mod selection;
 pub mod session_lock;
 pub mod shell;
 pub mod shm;
+pub mod single_pixel_buffer;
 pub mod socket;
 pub mod tablet_manager;
 pub mod text_input;
@@ -76,6 +80,7 @@ pub mod viewporter;
 pub mod virtual_keyboard;
 pub mod xdg_activation;
 pub mod xdg_foreign;
+pub mod xdg_toplevel_icon;
 #[cfg(feature = "xwayland")]
 pub mod xwayland_keyboard_grab;
 #[cfg(feature = "xwayland")]

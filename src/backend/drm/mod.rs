@@ -82,10 +82,9 @@ pub mod node;
 
 mod surface;
 
-use std::collections::HashSet;
 use std::sync::Once;
 
-use crate::utils::DevPath;
+use crate::utils::{DevPath, Physical, Size};
 pub use device::{
     DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEvent, EventMetadata as DrmEventMetadata, PlaneClaim,
     Time as DrmEventTime,
@@ -93,6 +92,7 @@ pub use device::{
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 pub use error::AccessError as DrmAccessError;
 pub use error::Error as DrmError;
+use indexmap::IndexSet;
 pub use node::{CreateDrmNodeError, DrmNode, NodeType};
 #[cfg(feature = "backend_gbm")]
 pub use surface::gbm::{Error as GbmBufferedSurfaceError, GbmBufferedSurface};
@@ -105,6 +105,8 @@ use drm::{
 use tracing::trace;
 
 use self::error::AccessError;
+
+use super::allocator::format::FormatSet;
 
 fn warn_legacy_fb_export() {
     static WARN_LEGACY_FB_EXPORT: Once = Once::new();
@@ -122,10 +124,10 @@ pub trait Framebuffer: AsRef<framebuffer::Handle> {
 /// A set of planes as supported by a crtc
 #[derive(Debug, Clone)]
 pub struct Planes {
-    /// The primary plane of the crtc (automatically selected for [DrmDevice::create_surface])
-    pub primary: PlaneInfo,
-    /// The cursor plane of the crtc, if available
-    pub cursor: Option<PlaneInfo>,
+    /// The primary plane(s) of the crtc
+    pub primary: Vec<PlaneInfo>,
+    /// The cursor plane(s) of the crtc, if available
+    pub cursor: Vec<PlaneInfo>,
     /// Overlay planes supported by the crtc, if available
     pub overlay: Vec<PlaneInfo>,
 }
@@ -140,7 +142,9 @@ pub struct PlaneInfo {
     /// z-position of the plane if available
     pub zpos: Option<i32>,
     /// Formats supported by this plane
-    pub formats: HashSet<DrmFormat>,
+    pub formats: FormatSet,
+    /// Recommended plane size in order of preference
+    pub size_hints: Option<Vec<Size<u16, Physical>>>,
 }
 
 fn planes(
@@ -148,8 +152,8 @@ fn planes(
     crtc: &crtc::Handle,
     has_universal_planes: bool,
 ) -> Result<Planes, DrmError> {
-    let mut primary = None;
-    let mut cursor = None;
+    let mut primary = Vec::with_capacity(1);
+    let mut cursor = Vec::new();
     let mut overlay = Vec::new();
 
     let planes = dev.plane_handles().map_err(|source| {
@@ -181,18 +185,20 @@ fn planes(
             let zpos = plane_zpos(dev, plane).ok().flatten();
             let type_ = plane_type(dev, plane)?;
             let formats = plane_formats(dev, plane)?;
+            let size_hints = plane_size_hints(dev, plane)?;
             let plane_info = PlaneInfo {
                 handle: plane,
                 type_,
                 zpos,
                 formats,
+                size_hints,
             };
             match type_ {
                 PlaneType::Primary => {
-                    primary = Some(plane_info);
+                    primary.push(plane_info);
                 }
                 PlaneType::Cursor => {
-                    cursor = Some(plane_info);
+                    cursor.push(plane_info);
                 }
                 PlaneType::Overlay => {
                     overlay.push(plane_info);
@@ -202,8 +208,8 @@ fn planes(
     }
 
     Ok(Planes {
-        primary: primary.expect("Crtc has no primary plane"),
-        cursor: if has_universal_planes { cursor } else { None },
+        primary,
+        cursor: if has_universal_planes { cursor } else { Vec::new() },
         overlay: if has_universal_planes { overlay } else { Vec::new() },
     })
 }
@@ -268,10 +274,7 @@ fn plane_zpos(dev: &(impl ControlDevice + DevPath), plane: plane::Handle) -> Res
     Ok(None)
 }
 
-fn plane_formats(
-    dev: &(impl ControlDevice + DevPath),
-    plane: plane::Handle,
-) -> Result<HashSet<DrmFormat>, DrmError> {
+fn plane_formats(dev: &(impl ControlDevice + DevPath), plane: plane::Handle) -> Result<FormatSet, DrmError> {
     // get plane formats
     let plane_info = dev.get_plane(plane).map_err(|source| {
         DrmError::Access(AccessError {
@@ -280,7 +283,7 @@ fn plane_formats(
             source,
         })
     })?;
-    let mut formats = HashSet::new();
+    let mut formats = IndexSet::new();
     for code in plane_info
         .formats()
         .iter()
@@ -401,7 +404,7 @@ fn plane_formats(
         formats
     );
 
-    Ok(formats)
+    Ok(FormatSet::from_formats(formats))
 }
 
 #[cfg(feature = "backend_gbm")]
@@ -431,4 +434,83 @@ fn plane_has_property(
         }
     }
     Ok(false)
+}
+
+#[repr(C)]
+// FIXME: use definition from drm_ffi once available
+struct drm_plane_size_hint {
+    width: u16,
+    height: u16,
+}
+
+fn plane_size_hints(
+    dev: &(impl ControlDevice + DevPath),
+    plane: plane::Handle,
+) -> Result<Option<Vec<Size<u16, Physical>>>, DrmError> {
+    let props = dev.get_properties(plane).map_err(|source| {
+        DrmError::Access(AccessError {
+            errmsg: "Failed to get properties of plane",
+            dev: dev.dev_path(),
+            source,
+        })
+    })?;
+    let (ids, vals) = props.as_props_and_values();
+    for (&id, &val) in ids.iter().zip(vals.iter()) {
+        let info = dev.get_property(id).map_err(|source| {
+            DrmError::Access(AccessError {
+                errmsg: "Failed to get property info",
+                dev: dev.dev_path(),
+                source,
+            })
+        })?;
+        if info.name().to_str().map(|x| x == "SIZE_HINTS").unwrap_or(false) {
+            let size_hints = if let drm::control::property::Value::Blob(blob_id) =
+                info.value_type().convert_value(val)
+            {
+                // Note that property value 0 (ie. no blob) is reserved for potential
+                // future use. Current userspace is expected to ignore the property
+                // if the value is 0
+                if blob_id == 0 {
+                    return Ok(None);
+                }
+
+                let blob_info = drm_ffi::mode::get_property_blob(dev.as_fd(), blob_id as u32, None).map_err(
+                    |source| {
+                        DrmError::Access(AccessError {
+                            errmsg: "Failed to get SIZE_HINTS blob info",
+                            dev: dev.dev_path(),
+                            source,
+                        })
+                    },
+                )?;
+
+                let mut data = Vec::with_capacity(blob_info.length as usize);
+                drm_ffi::mode::get_property_blob(dev.as_fd(), blob_id as u32, Some(&mut data)).map_err(
+                    |source| {
+                        DrmError::Access(AccessError {
+                            errmsg: "Failed to get SIZE_HINTS blob data",
+                            dev: dev.dev_path(),
+                            source,
+                        })
+                    },
+                )?;
+
+                let num_size_hints = data.len() / std::mem::size_of::<drm_plane_size_hint>();
+                let size_hints = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const drm_plane_size_hint, num_size_hints)
+                };
+                Some(
+                    size_hints
+                        .iter()
+                        .map(|size_hint| Size::from((size_hint.width, size_hint.height)))
+                        .collect(),
+                )
+            } else {
+                tracing::debug!(?plane, "SIZE_HINTS property has wrong value type");
+                None
+            };
+            return Ok(size_hints);
+        }
+    }
+    Ok(None)
 }

@@ -7,13 +7,13 @@ use std::{
         net::UnixStream,
         process::CommandExt,
     },
-    process::Command,
+    process::{Child, Command},
     sync::{Arc, Mutex},
+    thread,
 };
 
-use tracing::{info, trace};
-use wayland_server::backend::ClientData;
-use wayland_server::backend::DisconnectReason;
+use tracing::{error, info, trace};
+use wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use wayland_server::{Client, DisplayHandle};
 
 use crate::{utils::user_data::UserDataMap, wayland::compositor::CompositorClientState};
@@ -186,7 +186,7 @@ impl XWayland {
 
         info!("spawning XWayland instance");
 
-        let _ = command.spawn()?;
+        let child = command.spawn()?;
 
         // SAFETY: RawFd's AsRawFd impl is infallible.
         let wrapper = unsafe { calloop::generic::FdWrapper::new(displayfd_recv.as_raw_fd()) };
@@ -211,6 +211,7 @@ impl XWayland {
                 #[cfg(feature = "wayland_frontend")]
                 compositor_state: CompositorClientState::default(),
                 data_map,
+                child: Mutex::new(Some(child)),
             }),
         )?;
 
@@ -365,9 +366,25 @@ pub struct XWaylandClientData {
     #[cfg(feature = "wayland_frontend")]
     pub compositor_state: CompositorClientState,
     data_map: UserDataMap,
+    child: Mutex<Option<Child>>,
 }
 
-impl ClientData for XWaylandClientData {}
+impl ClientData for XWaylandClientData {
+    fn disconnected(&self, _client_id: ClientId, reason: DisconnectReason) {
+        if let DisconnectReason::ProtocolError(err) = reason {
+            error!("Xwayland disconnected: {}", err);
+        }
+
+        let mut child = self.child.lock().unwrap().take().unwrap();
+        thread::spawn(move || {
+            if let Ok(status) = child.wait() {
+                if !status.success() {
+                    error!("Xwayland terminated: {}", status);
+                }
+            }
+        });
+    }
+}
 
 impl XWaylandClientData {
     /// Access user_data map for a xwayland client

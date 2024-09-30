@@ -7,6 +7,7 @@ use crate::backend::renderer::buffer_dimensions;
 use crate::utils::Size;
 use crate::wayland::compositor::SurfaceAttributes;
 use crate::wayland::compositor::{self, BufferAssignment};
+use crate::wayland::viewporter::{ViewportCachedState, ViewporterSurfaceState};
 use _session_lock::ext_session_lock_surface_v1::ExtSessionLockSurfaceV1;
 use _session_lock::ext_session_lock_v1::{Error, ExtSessionLockV1, Request};
 use wayland_protocols::ext::session_lock::v1::server::{self as _session_lock, ext_session_lock_surface_v1};
@@ -67,14 +68,9 @@ where
                 // Ensure surface has no existing buffers attached.
                 let has_buffer = compositor::with_states(&surface, |states| {
                     let cached = &states.cached_state;
-                    let pending = matches!(
-                        cached.pending::<SurfaceAttributes>().buffer,
-                        Some(BufferAssignment::NewBuffer(_))
-                    );
-                    let current = matches!(
-                        cached.current::<SurfaceAttributes>().buffer,
-                        Some(BufferAssignment::NewBuffer(_))
-                    );
+                    let mut guard = cached.get::<SurfaceAttributes>();
+                    let pending = matches!(guard.pending().buffer, Some(BufferAssignment::NewBuffer(_)));
+                    let current = matches!(guard.current().buffer, Some(BufferAssignment::NewBuffer(_)));
                     pending || current
                 });
                 if has_buffer {
@@ -108,7 +104,7 @@ where
                 compositor::add_pre_commit_hook::<D, _>(&surface, |_state, _dh, surface| {
                     compositor::with_states(surface, |states| {
                         let attributes = states.data_map.get::<Mutex<LockSurfaceAttributes>>();
-                        let mut attributes = attributes.unwrap().lock().unwrap();
+                        let attributes = attributes.unwrap().lock().unwrap();
 
                         let Some(state) = attributes.last_acked else {
                             attributes.surface.post_error(
@@ -120,7 +116,8 @@ where
 
                         // Verify the attached buffer: ext-session-lock requires no NULL buffers
                         // and an exact dimentions match.
-                        let surface_attrs = states.cached_state.pending::<SurfaceAttributes>();
+                        let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                        let surface_attrs = guard.pending();
                         if let Some(assignment) = surface_attrs.buffer.as_ref() {
                             match assignment {
                                 BufferAssignment::Removed => {
@@ -128,30 +125,49 @@ where
                                         ext_session_lock_surface_v1::Error::NullBuffer,
                                         "Surface attached a NULL buffer.",
                                     );
-                                    return;
                                 }
                                 BufferAssignment::NewBuffer(buffer) => {
                                     if let Some(buf_size) = buffer_dimensions(buffer) {
-                                        let scale = surface_attrs.buffer_scale;
-                                        let transform = surface_attrs.buffer_transform.into();
-                                        let surface_size = buf_size.to_logical(scale, transform);
+                                        let viewport = states
+                                            .data_map
+                                            .get::<ViewporterSurfaceState>()
+                                            .map(|v| v.lock().unwrap());
+                                        let surface_size = if let Some(dest) =
+                                            viewport.as_ref().and_then(|_| {
+                                                let mut guard =
+                                                    states.cached_state.get::<ViewportCachedState>();
+                                                let viewport_state = guard.pending();
+                                                viewport_state.dst
+                                            }) {
+                                            Size::from((dest.w as u32, dest.h as u32))
+                                        } else {
+                                            let scale = surface_attrs.buffer_scale;
+                                            let transform = surface_attrs.buffer_transform.into();
+                                            let surface_size = buf_size.to_logical(scale, transform);
 
-                                        let surface_size =
-                                            Size::from((surface_size.w as u32, surface_size.h as u32));
+                                            Size::from((surface_size.w as u32, surface_size.h as u32))
+                                        };
 
                                         if Some(surface_size) != state.size {
                                             attributes.surface.post_error(
                                                 ext_session_lock_surface_v1::Error::DimensionsMismatch,
                                                 "Surface dimensions do not match acked configure.",
                                             );
-                                            return;
                                         }
                                     }
                                 }
                             }
                         }
+                    });
+                });
+                compositor::add_post_commit_hook::<D, _>(&surface, |_state, _dh, surface| {
+                    compositor::with_states(surface, |states| {
+                        let attributes = states.data_map.get::<Mutex<LockSurfaceAttributes>>();
+                        let mut attributes = attributes.unwrap().lock().unwrap();
 
-                        attributes.current = state;
+                        if let Some(state) = attributes.last_acked {
+                            attributes.current = state;
+                        }
                     });
                 });
 

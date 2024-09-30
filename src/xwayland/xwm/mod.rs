@@ -92,7 +92,7 @@
 //! ```
 
 use crate::{
-    utils::{x11rb::X11Source, Logical, Point, Rectangle, Size},
+    utils::{x11rb::X11Source, Client, Coordinate, Logical, Point, Rectangle, Size},
     wayland::{
         selection::SelectionTarget,
         xwayland_shell::{self, XWaylandShellHandler},
@@ -108,11 +108,15 @@ use std::{
         io::{AsFd, BorrowedFd, OwnedFd},
         net::UnixStream,
     },
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
 };
 use tracing::{debug, debug_span, error, info, trace, warn};
-use wayland_server::{Client, Resource};
+use wayland_server::Resource;
 
+pub use x11rb::protocol::xproto::Window as X11Window;
 use x11rb::{
     connection::Connection as _,
     errors::ReplyOrIdError,
@@ -124,8 +128,8 @@ use x11rb::{
             Atom, AtomEnum, ChangeWindowAttributesAux, ConfigWindow, ConfigureNotifyEvent,
             ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, CursorWrapper, EventMask,
             FontWrapper, GcontextWrapper, GetPropertyReply, ImageFormat, PixmapWrapper, PropMode, Property,
-            QueryExtensionReply, Screen, SelectionNotifyEvent, SelectionRequestEvent, StackMode,
-            Window as X11Window, WindowClass, CONFIGURE_NOTIFY_EVENT, SELECTION_NOTIFY_EVENT,
+            QueryExtensionReply, Screen, SelectionNotifyEvent, SelectionRequestEvent, StackMode, WindowClass,
+            CONFIGURE_NOTIFY_EVENT, SELECTION_NOTIFY_EVENT,
         },
         Event,
     },
@@ -134,6 +138,8 @@ use x11rb::{
     COPY_DEPTH_FROM_PARENT,
 };
 
+pub mod settings;
+use settings::{NameError, Value, XSettings};
 mod surface;
 pub use self::surface::*;
 
@@ -198,6 +204,7 @@ mod atoms {
             _NET_WM_STATE_FULLSCREEN,
             _NET_WM_STATE_FOCUSED,
             _NET_SUPPORTING_WM_CHECK,
+            _XSETTINGS_SETTINGS,
 
             // selection
             _WL_SELECTION,
@@ -208,6 +215,7 @@ mod atoms {
             TIMESTAMP,
             INCR,
             DELETE,
+            _XSETTINGS_S0,
         }
     }
 }
@@ -215,7 +223,7 @@ pub use self::atoms::Atoms;
 
 use super::XWaylandClientData;
 
-crate::utils::ids::id_gen!(next_xwm_id, XWM_ID, XWM_IDS);
+crate::utils::ids::id_gen!(xwm_id);
 
 /// Id of an X11 WM
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -378,6 +386,9 @@ pub trait XwmHandler {
     fn cleared_selection(&mut self, xwm: XwmId, selection: SelectionTarget) {
         let _ = (xwm, selection);
     }
+
+    /// WM has lost connection to X server
+    fn disconnected(&mut self, _xwm: XwmId) {}
 }
 
 /// The runtime state of an reparenting XWayland window manager.
@@ -385,9 +396,11 @@ pub trait XwmHandler {
 pub struct X11Wm {
     id: XwmId,
     conn: Arc<RustConnection>,
+    client_scale: Arc<AtomicU32>,
     screen: Screen,
     wm_window: X11Window,
     atoms: Atoms,
+    xsettings: XSettings,
 
     pub(crate) unpaired_surfaces: HashMap<u64, X11Window>,
     sequences_to_ignore: BinaryHeap<Reverse<u16>>,
@@ -410,7 +423,7 @@ impl Drop for X11Wm {
     fn drop(&mut self) {
         // TODO: Not really needed for Xwayland, but maybe cleanup set root properties?
         let _ = self.conn.destroy_window(self.wm_window);
-        XWM_IDS.lock().unwrap().remove(&self.id.0);
+        xwm_id::remove(self.id.0);
     }
 }
 
@@ -663,6 +676,23 @@ impl From<ConnectionError> for SelectionError {
     }
 }
 
+/// Errors generated updating XSETTINGS
+#[derive(Debug, thiserror::Error)]
+pub enum SettingsError {
+    /// X11 Error occured updating XSETTINGS
+    #[error(transparent)]
+    X11Error(#[from] ConnectionError),
+    /// A provided name isn't allowed
+    #[error("Name '{name}' isn't valid: {error}")]
+    NameError {
+        /// Name that failed to parse
+        name: String,
+        #[source]
+        /// Validation error
+        error: NameError,
+    },
+}
+
 impl X11Wm {
     /// Start a new window manager for a given Xwayland connection
     ///
@@ -674,14 +704,14 @@ impl X11Wm {
     pub fn start_wm<D>(
         handle: LoopHandle<'static, D>,
         connection: UnixStream,
-        client: Client,
+        client: wayland_server::Client,
     ) -> Result<Self, Box<dyn std::error::Error>>
     where
         D: XwmHandler,
         D: xwayland_shell::XWaylandShellHandler,
         D: 'static,
     {
-        let id = XwmId(next_xwm_id());
+        let id = XwmId(xwm_id::next());
         let span = debug_span!("xwayland_wm", id = id.0);
         let _guard = span.enter();
 
@@ -690,7 +720,6 @@ impl X11Wm {
         let stream = DefaultStream::from_unix_stream(connection)?.0;
         let conn = RustConnection::connect_to_stream(stream, screen)?;
         let atoms = Atoms::new(&conn)?.reply()?;
-
         let screen = conn.setup().roots[0].clone();
 
         {
@@ -807,17 +836,17 @@ impl X11Wm {
             "Smithay X WM".as_bytes(),
         )?;
         debug!(window = win, "Created WM Window");
+        let xsettings = XSettings::new(&conn, screen.root_depth, screen.root, &atoms)?;
         conn.flush()?;
 
         let conn = Arc::new(conn);
         let source = X11Source::new(Arc::clone(&conn), win, atoms._SMITHAY_CLOSE_CONNECTION);
 
+        let client_data = client.get_data::<XWaylandClientData>().unwrap();
+        let client_scale = client_data.compositor_state.clone_client_scale();
+
         // We need this for the commit hook.
-        client
-            .get_data::<XWaylandClientData>()
-            .unwrap()
-            .user_data()
-            .insert_if_missing(|| id);
+        client_data.user_data().insert_if_missing(|| id);
 
         let _xfixes_data = conn
             .query_extension(x11rb::protocol::xfixes::X11_EXTENSION_NAME.as_bytes())?
@@ -835,8 +864,10 @@ impl X11Wm {
         let wm = Self {
             id,
             conn,
+            client_scale,
             screen,
             atoms,
+            xsettings,
             wm_window: win,
             _xfixes_data,
             clipboard,
@@ -850,9 +881,14 @@ impl X11Wm {
         };
 
         let event_handle = handle.clone();
-        handle.insert_source(source, move |event, _, data| {
-            if let Err(err) = handle_event(&event_handle, data, id, event) {
-                warn!(id = id.0, err = ?err, "Failed to handle X11 event");
+        handle.insert_source(source, move |event, _, data| match event {
+            calloop::channel::Event::Msg(event) => {
+                if let Err(err) = handle_event(&event_handle, data, id, event) {
+                    warn!(id = id.0, err = ?err, "Failed to handle X11 event");
+                }
+            }
+            calloop::channel::Event::Closed => {
+                data.disconnected(id);
             }
         })?;
         Ok(wm)
@@ -1234,6 +1270,22 @@ impl X11Wm {
         self.conn.flush()?;
         Ok(())
     }
+
+    /// Updates XSETTINGS with the newly provided name/value-pairs.
+    pub fn set_xsettings(
+        &mut self,
+        settings: impl Iterator<Item = (String, Value)>,
+    ) -> Result<(), SettingsError> {
+        for (name, value) in settings {
+            self.xsettings
+                .set(name.clone(), value)
+                .map_err(move |error| SettingsError::NameError { name, error })?;
+        }
+
+        self.xsettings.update(&self.conn)?;
+
+        Ok(())
+    }
 }
 
 fn handle_event<D>(
@@ -1259,7 +1311,7 @@ where
             // "to_ignore <= seqno". This is equivalent to "to_ignore - seqno <= 0", which is what we
             // check instead. Since sequence numbers are unsigned, we need a trick: We decide
             // that values from [MAX/2, MAX] count as "<= 0" and the rest doesn't.
-            if to_ignore.wrapping_sub(seqno) <= u16::max_value() / 2 {
+            if to_ignore.wrapping_sub(seqno) <= u16::MAX / 2 {
                 // If the two sequence numbers are equal, this event should be ignored.
                 should_ignore = to_ignore == seqno;
                 break;
@@ -1280,6 +1332,7 @@ where
     match event {
         Event::CreateNotify(n) => {
             if n.window == xwm.wm_window
+                || n.window == xwm.xsettings.window
                 || n.window == xwm.clipboard.window
                 || xwm.clipboard.incoming.iter().any(|i| n.window == i.window)
                 || n.window == xwm.primary.window
@@ -1299,17 +1352,19 @@ where
             }
 
             let geo = conn.get_geometry(n.window)?.reply()?;
+            let geometry = Rectangle::<i32, Client>::from_loc_and_size(
+                (geo.x as i32, geo.y as i32),
+                (geo.width as i32, geo.height as i32),
+            )
+            .to_logical(xwm.client_scale.load(Ordering::Acquire) as i32);
 
             let surface = X11Surface::new(
-                xwm_id,
+                Some(xwm),
                 n.window,
                 n.override_redirect,
                 Arc::downgrade(&conn),
                 xwm.atoms,
-                Rectangle::from_loc_and_size(
-                    (geo.x as i32, geo.y as i32),
-                    (geo.width as i32, geo.height as i32),
-                ),
+                geometry,
             );
             surface.update_properties()?;
             xwm.windows.push(surface.clone());
@@ -1411,27 +1466,30 @@ where
         Event::ConfigureRequest(r) => {
             if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == r.window).cloned() {
                 drop(_guard);
+
+                let client_scale = xwm.client_scale.load(Ordering::Acquire);
+
                 // Pass the request to downstream to decide
                 state.configure_request(
                     xwm_id,
                     surface.clone(),
                     if u16::from(r.value_mask) & u16::from(ConfigWindow::X) != 0 {
-                        Some(i32::from(r.x))
+                        Some((r.x as i32).downscale(client_scale as i32))
                     } else {
                         None
                     },
                     if u16::from(r.value_mask) & u16::from(ConfigWindow::Y) != 0 {
-                        Some(i32::from(r.y))
+                        Some((r.y as i32).downscale(client_scale as i32))
                     } else {
                         None
                     },
                     if u16::from(r.value_mask) & u16::from(ConfigWindow::WIDTH) != 0 {
-                        Some(u32::from(r.width))
+                        Some((r.width as u32).downscale(client_scale))
                     } else {
                         None
                     },
                     if u16::from(r.value_mask) & u16::from(ConfigWindow::HEIGHT) != 0 {
-                        Some(u32::from(r.height))
+                        Some((r.height as u32).downscale(client_scale))
                     } else {
                         None
                     },
@@ -1466,6 +1524,14 @@ where
         }
         Event::ConfigureNotify(n) => {
             trace!(window = ?n, "configured X11 Window");
+
+            let client_scale = xwm.client_scale.load(Ordering::Acquire);
+            let geometry = Rectangle::<i32, Client>::from_loc_and_size(
+                (n.x as i32, n.y as i32),
+                (n.width as i32, n.height as i32),
+            )
+            .to_logical(client_scale as i32);
+
             if let Some(surface) = xwm
                 .windows
                 .iter()
@@ -1476,7 +1542,7 @@ where
                 state.configure_notify(
                     xwm_id,
                     surface,
-                    Rectangle::from_loc_and_size((n.x as i32, n.y as i32), (n.width as i32, n.height as i32)),
+                    geometry,
                     if n.above_sibling == x11rb::NONE {
                         None
                     } else {
@@ -1485,10 +1551,6 @@ where
                 );
             } else if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
                 if surface.is_override_redirect() {
-                    let geometry = Rectangle::from_loc_and_size(
-                        (n.x as i32, n.y as i32),
-                        (n.width as i32, n.height as i32),
-                    );
                     surface.state.lock().unwrap().geometry = geometry;
                     drop(_guard);
                     state.configure_notify(
@@ -2119,6 +2181,7 @@ where
                         .windows
                         .iter_mut()
                         .find(|x| x.window_id() == msg.window || x.mapped_window_id() == Some(msg.window))
+                        .cloned()
                     {
                         drop(_guard);
 
@@ -2129,7 +2192,6 @@ where
                         let surface_state = xsurface.state.clone();
                         let mut guard = surface_state.lock().unwrap();
                         guard.wl_surface_serial = Some(serial);
-                        let window_id = xsurface.window_id();
 
                         if let Some(wl_surface) =
                             xwayland_shell::XWaylandShellHandler::xwayland_shell_state(state)
@@ -2137,13 +2199,14 @@ where
                                 .clone()
                         {
                             debug!(
-                                window = ?window_id,
+                                window = ?xsurface.window_id(),
                                 wl_surface = ?wl_surface.id().protocol_id(),
                                 "associated X11 window to wl_surface",
                             );
 
                             guard.wl_surface = Some(wl_surface.clone());
-                            XWaylandShellHandler::surface_associated(state, wl_surface, window_id);
+                            std::mem::drop(guard);
+                            XWaylandShellHandler::surface_associated(state, xwm_id, wl_surface, xsurface);
                         } else {
                             debug!(
                                 window = ?msg.window,
@@ -2151,7 +2214,7 @@ where
                                 "no matching wl_surface for X11 window",
                             );
                             let xwm = state.xwm_state(xwm_id);
-                            xwm.unpaired_surfaces.insert(serial, window_id);
+                            xwm.unpaired_surfaces.insert(serial, xsurface.window_id());
                             guard.wl_surface = None;
                         }
                     }
@@ -2422,7 +2485,7 @@ fn send_selection_notify_resp(
 fn send_configure_notify(
     conn: &RustConnection,
     win: &X11Window,
-    geometry: Rectangle<i32, Logical>,
+    geometry: Rectangle<i32, Client>,
     override_redirect: bool,
 ) -> Result<(), ConnectionError> {
     conn.send_event(

@@ -11,12 +11,12 @@ use crate::backend::renderer::{ImportDmaWl, ImportMemWl};
 use crate::backend::{egl::display::EGLBufferReader, renderer::ImportEgl};
 use crate::{
     backend::{
-        allocator::{dmabuf::Dmabuf, Format, Fourcc},
+        allocator::{dmabuf::Dmabuf, format::FormatSet, Format, Fourcc},
         egl::EGLContext,
         renderer::{
             element::UnderlyingStorage,
             gles::{element::*, *},
-            sync, Bind, Blit, DebugFlags, ExportMem, ImportDma, ImportMem, Offscreen, Renderer,
+            sync, Bind, Blit, Color32F, DebugFlags, ExportMem, ImportDma, ImportMem, Offscreen, Renderer,
             TextureFilter, Unbind,
         },
     },
@@ -29,7 +29,6 @@ use wayland_server::protocol::{wl_buffer, wl_shm};
 use glow::Context;
 use std::{
     borrow::{Borrow, BorrowMut},
-    collections::HashSet,
     sync::Arc,
 };
 
@@ -85,8 +84,8 @@ impl GlowRenderer {
     /// # Implementation details
     ///
     /// - Texture handles created by the resulting renderer are valid for every rendered created with an
-    /// `EGLContext` shared with the given one (see `EGLContext::new_shared`) and can be used on
-    /// any of these renderers.
+    ///   `EGLContext` shared with the given one (see `EGLContext::new_shared`) and can be used on
+    ///   any of these renderers.
     /// - This renderer has no default framebuffer, use `Bind::bind` before rendering.
     /// - Binding a new target, while another one is already bound, will replace the current target.
     /// - Shm buffers can be released after a successful import, without the texture handle becoming invalid.
@@ -239,6 +238,11 @@ impl Renderer for GlowRenderer {
     fn wait(&mut self, sync: &sync::SyncPoint) -> Result<(), Self::Error> {
         self.gl.wait(sync)
     }
+
+    #[profiling::function]
+    fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {
+        self.gl.cleanup_texture_cache()
+    }
 }
 
 impl<'frame> Frame for GlowFrame<'frame> {
@@ -250,7 +254,7 @@ impl<'frame> Frame for GlowFrame<'frame> {
     }
 
     #[profiling::function]
-    fn clear(&mut self, color: [f32; 4], at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
+    fn clear(&mut self, color: Color32F, at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
         self.frame.as_mut().unwrap().clear(color, at)
     }
 
@@ -259,7 +263,7 @@ impl<'frame> Frame for GlowFrame<'frame> {
         &mut self,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
-        color: [f32; 4],
+        color: Color32F,
     ) -> Result<(), Self::Error> {
         self.frame.as_mut().unwrap().draw_solid(dst, damage, color)
     }
@@ -430,7 +434,7 @@ impl ImportDma for GlowRenderer {
     ) -> Result<GlesTexture, GlesError> {
         self.gl.import_dmabuf(buffer, damage)
     }
-    fn dmabuf_formats(&self) -> Box<dyn Iterator<Item = Format>> {
+    fn dmabuf_formats(&self) -> FormatSet {
         self.gl.dmabuf_formats()
     }
     fn has_dmabuf_format(&self, format: Format) -> bool {
@@ -484,7 +488,7 @@ where
     fn bind(&mut self, target: T) -> Result<(), GlesError> {
         self.gl.bind(target)
     }
-    fn supported_formats(&self) -> Option<HashSet<Format>> {
+    fn supported_formats(&self) -> Option<FormatSet> {
         self.gl.supported_formats()
     }
 }

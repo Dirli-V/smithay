@@ -9,7 +9,7 @@ use crate::{
     backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState},
     input::{GrabStatus, Seat, SeatHandler},
     utils::Serial,
-    utils::{IsAlive, Logical, Point},
+    utils::{Clock, IsAlive, Logical, Monotonic, Point},
 };
 
 mod cursor_image;
@@ -222,7 +222,7 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
     pub fn motion(
         &self,
         data: &mut D,
-        focus: Option<(<D as SeatHandler>::PointerFocus, Point<i32, Logical>)>,
+        focus: Option<(<D as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
         let mut inner = self.inner.lock().unwrap();
@@ -242,7 +242,7 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
     pub fn relative_motion(
         &self,
         data: &mut D,
-        focus: Option<(<D as SeatHandler>::PointerFocus, Point<i32, Logical>)>,
+        focus: Option<(<D as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
         event: &RelativeMotionEvent,
     ) {
         let mut inner = self.inner.lock().unwrap();
@@ -435,6 +435,26 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
         self.inner.lock().unwrap().location
     }
 
+    /// Update the current location of this pointer in the global space,
+    /// without sending any event and without updating the focus.
+    ///
+    /// If you want to update the location, and update the focus,
+    /// and send events, use [Self::motion] instead of this.
+    ///
+    /// This is useful when the pointer is only moved by relative events,
+    /// such as when a pointer lock is held by the focused surface.
+    /// The client can give us a cursor position hint, which corresponds to
+    /// the actual location the client may be rendering a pointer at.
+    /// This position hint should be used as the initial location
+    /// when the pointer lock is deactivated.
+    ///
+    /// The next time [Self::motion] is called, the focus will be
+    /// updated accordingly as if this function was never called.
+    /// Clients will never be notified of a location hint.
+    pub fn set_location(&self, location: Point<f64, Logical>) {
+        self.inner.lock().unwrap().location = location;
+    }
+
     /// Access the [`Serial`] of the last `pointer_enter` event, if that focus is still active.
     ///
     /// In other words this will return `None` again, once a `pointer_leave` event occurred.
@@ -515,7 +535,7 @@ impl<'a, D: SeatHandler + 'static> PointerInnerHandle<'a, D> {
     }
 
     /// Access the current focus of this pointer
-    pub fn current_focus(&self) -> Option<(<D as SeatHandler>::PointerFocus, Point<i32, Logical>)> {
+    pub fn current_focus(&self) -> Option<(<D as SeatHandler>::PointerFocus, Point<f64, Logical>)> {
         self.inner.focus.clone()
     }
 
@@ -546,7 +566,7 @@ impl<'a, D: SeatHandler + 'static> PointerInnerHandle<'a, D> {
     pub fn motion(
         &mut self,
         data: &mut D,
-        focus: Option<(<D as SeatHandler>::PointerFocus, Point<i32, Logical>)>,
+        focus: Option<(<D as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
         self.inner.motion(data, self.seat, focus, event);
@@ -560,7 +580,7 @@ impl<'a, D: SeatHandler + 'static> PointerInnerHandle<'a, D> {
     pub fn relative_motion(
         &mut self,
         data: &mut D,
-        focus: Option<(<D as SeatHandler>::PointerFocus, Point<i32, Logical>)>,
+        focus: Option<(<D as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
         event: &RelativeMotionEvent,
     ) {
         self.inner.relative_motion(data, self.seat, focus, event);
@@ -670,8 +690,8 @@ impl<'a, D: SeatHandler + 'static> PointerInnerHandle<'a, D> {
 }
 
 pub(crate) struct PointerInternal<D: SeatHandler> {
-    pub(crate) focus: Option<(<D as SeatHandler>::PointerFocus, Point<i32, Logical>)>,
-    pending_focus: Option<(<D as SeatHandler>::PointerFocus, Point<i32, Logical>)>,
+    pub(crate) focus: Option<(<D as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
+    pending_focus: Option<(<D as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
     location: Point<f64, Logical>,
     grab: GrabStatus<dyn PointerGrab<D>>,
     pressed_buttons: Vec<u32>,
@@ -724,7 +744,7 @@ impl<D: SeatHandler + 'static> PointerInternal<D> {
                 &MotionEvent {
                     location,
                     serial,
-                    time: 0,
+                    time: Clock::<Monotonic>::new().now().as_millis(),
                 },
             );
         }
@@ -756,13 +776,13 @@ impl<D: SeatHandler + 'static> PointerInternal<D> {
         &mut self,
         data: &mut D,
         seat: &Seat<D>,
-        focus: Option<(<D as SeatHandler>::PointerFocus, Point<i32, Logical>)>,
+        focus: Option<(<D as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
         self.location = event.location;
         if let Some((focus, loc)) = focus {
             let event = MotionEvent {
-                location: event.location - loc.to_f64(),
+                location: event.location - loc,
                 serial: event.serial,
                 time: event.time,
             };
@@ -791,7 +811,7 @@ impl<D: SeatHandler + 'static> PointerInternal<D> {
         &mut self,
         data: &mut D,
         seat: &Seat<D>,
-        _focus: Option<(<D as SeatHandler>::PointerFocus, Point<i32, Logical>)>,
+        _focus: Option<(<D as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
         event: &RelativeMotionEvent,
     ) {
         if let Some((focused, _)) = self.focus.as_mut() {

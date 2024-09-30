@@ -12,7 +12,7 @@ use wayland_server::{
 
 use super::WaylandFocus;
 use crate::{
-    backend::input::KeyState,
+    backend::input::{KeyState, Keycode},
     input::{
         keyboard::{KeyboardHandle, KeyboardTarget, KeysymHandle, ModifiersState},
         Seat, SeatHandler, SeatState,
@@ -21,7 +21,7 @@ use crate::{
     wayland::{input_method::InputMethodSeat, text_input::TextInputSeat},
 };
 
-impl<D: SeatHandler + 'static> KeyboardHandle<D>
+impl<D> KeyboardHandle<D>
 where
     D: SeatHandler + 'static,
     <D as SeatHandler>::KeyboardFocus: WaylandFocus,
@@ -66,7 +66,7 @@ where
         if let Some((focused, serial)) = guard.focus.as_ref() {
             if focused.same_client_as(&kbd.id()) {
                 let serialized = guard.mods_state.serialized;
-                let keys = serialize_pressed_keys(guard.pressed_keys.iter().cloned().collect());
+                let keys = serialize_pressed_keys(guard.pressed_keys.iter().copied());
                 kbd.enter((*serial).into(), &focused.wl_surface().unwrap(), keys);
                 // Modifiers must be send after enter event.
                 kbd.modifiers(
@@ -78,7 +78,17 @@ where
                 );
             }
         }
-        self.arc.known_kbds.lock().unwrap().push(kbd);
+        self.arc.known_kbds.lock().unwrap().push(kbd.downgrade());
+    }
+}
+
+impl<D: SeatHandler + 'static> KeyboardHandle<D> {
+    /// Attempt to retrieve a [`KeyboardHandle`] from an existing resource
+    ///
+    /// May return `None` for a valid `WlKeyboard` that was created without
+    /// the keyboard capability.
+    pub fn from_resource(seat: &WlKeyboard) -> Option<Self> {
+        seat.data::<KeyboardUserData<D>>()?.handle.clone()
     }
 }
 
@@ -131,6 +141,10 @@ pub(crate) fn for_each_focused_kbds<D: SeatHandler + 'static>(
     if let Some(keyboard) = seat.get_keyboard() {
         let inner = keyboard.arc.known_kbds.lock().unwrap();
         for kbd in &*inner {
+            let Ok(kbd) = kbd.upgrade() else {
+                continue;
+            };
+
             if kbd.id().same_client_as(&surface.id()) {
                 f(kbd.clone())
             }
@@ -138,9 +152,8 @@ pub(crate) fn for_each_focused_kbds<D: SeatHandler + 'static>(
     }
 }
 
-fn serialize_pressed_keys(keys: Vec<u32>) -> Vec<u8> {
-    let serialized = unsafe { ::std::slice::from_raw_parts(keys.as_ptr() as *const u8, keys.len() * 4) };
-    serialized.into()
+fn serialize_pressed_keys(keys: impl Iterator<Item = Keycode>) -> Vec<u8> {
+    keys.flat_map(|key| (key.raw() - 8).to_ne_bytes()).collect()
 }
 
 impl<D: SeatHandler + 'static> KeyboardTarget<D> for WlSurface {
@@ -150,7 +163,7 @@ impl<D: SeatHandler + 'static> KeyboardTarget<D> for WlSurface {
             kbd.enter(
                 serial.into(),
                 self,
-                serialize_pressed_keys(keys.iter().map(|h| h.raw_code().raw() - 8).collect()),
+                serialize_pressed_keys(keys.iter().map(|h| h.raw_code())),
             )
         });
 

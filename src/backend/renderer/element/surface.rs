@@ -23,7 +23,7 @@
 //! # use smithay::{
 //! #     backend::allocator::{Fourcc, dmabuf::Dmabuf},
 //! #     backend::renderer::{
-//! #         DebugFlags, Frame, ImportDma, ImportDmaWl, ImportMem, ImportMemWl, Renderer, Texture,
+//! #         Color32F, DebugFlags, Frame, ImportDma, ImportDmaWl, ImportMem, ImportMemWl, Renderer, Texture,
 //! #         TextureFilter, sync::SyncPoint,
 //! #     },
 //! #     utils::{Buffer, Physical},
@@ -52,14 +52,14 @@
 //! #     type TextureId = FakeTexture;
 //! #
 //! #     fn id(&self) -> usize { unimplemented!() }
-//! #     fn clear(&mut self, _: [f32; 4], _: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
+//! #     fn clear(&mut self, _: Color32F, _: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
 //! #         unimplemented!()
 //! #     }
 //! #     fn draw_solid(
 //! #         &mut self,
 //! #         _dst: Rectangle<i32, Physical>,
 //! #         _damage: &[Rectangle<i32, Physical>],
-//! #         _color: [f32; 4],
+//! #         _color: Color32F,
 //! #     ) -> Result<(), Self::Error> {
 //! #         unimplemented!()
 //! #     }
@@ -230,7 +230,7 @@ use crate::{
             Buffer, DamageSet, DamageSnapshot, OpaqueRegions, RendererSurfaceState,
             RendererSurfaceStateUserData, SurfaceView,
         },
-        Frame, ImportAll, Renderer, Texture,
+        Color32F, Frame, ImportAll, Renderer, Texture,
     },
     utils::{Buffer as BufferCoords, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::{
@@ -269,9 +269,7 @@ where
             let data = states.data_map.get::<RendererSurfaceStateUserData>();
 
             if let Some(data) = data {
-                let data = &*data.borrow();
-
-                if let Some(view) = data.view() {
+                if let Some(view) = data.lock().unwrap().view() {
                     location += view.offset.to_f64().to_physical(scale);
                     TraversalAction::DoChildren(location)
                 } else {
@@ -286,7 +284,7 @@ where
             let data = states.data_map.get::<RendererSurfaceStateUserData>();
 
             if let Some(data) = data {
-                let has_view = if let Some(view) = data.borrow().view() {
+                let has_view = if let Some(view) = data.lock().unwrap().view() {
                     location += view.offset.to_f64().to_physical(scale);
                     true
                 } else {
@@ -312,6 +310,15 @@ where
     surfaces
 }
 
+/// Texture used for the [`WaylandSurfaceRenderElement`]
+#[derive(Debug)]
+pub enum WaylandSurfaceTexture<R: Renderer> {
+    /// A renderer texture
+    Texture(<R as Renderer>::TextureId),
+    /// A solid color
+    SolidColor(Color32F),
+}
+
 /// A single surface render element
 pub struct WaylandSurfaceRenderElement<R: Renderer> {
     id: Id,
@@ -326,7 +333,7 @@ pub struct WaylandSurfaceRenderElement<R: Renderer> {
     buffer_dimensions: Size<i32, BufferCoords>,
     damage: DamageSnapshot<i32, BufferCoords>,
     opaque_regions: OpaqueRegions<i32, Logical>,
-    texture: R::TextureId,
+    texture: WaylandSurfaceTexture<R>,
 }
 
 impl<R: Renderer> fmt::Debug for WaylandSurfaceRenderElement<R> {
@@ -355,8 +362,8 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
         let id = Id::from_wayland_resource(surface);
         crate::backend::renderer::utils::import_surface(renderer, states)?;
 
-        let alpha_modifier_state = states.cached_state.current::<AlphaModifierSurfaceCachedState>();
-        let alpha_multiplier = alpha_modifier_state.multiplier_f32().unwrap_or(1.0);
+        let mut alpha_modifier_state = states.cached_state.get::<AlphaModifierSurfaceCachedState>();
+        let alpha_multiplier = alpha_modifier_state.current().multiplier_f32().unwrap_or(1.0);
 
         let Some(data_ref) = states.data_map.get::<RendererSurfaceStateUserData>() else {
             return Ok(None);
@@ -367,7 +374,7 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
             location,
             alpha * alpha_multiplier,
             kind,
-            &data_ref.borrow(),
+            &data_ref.lock().unwrap(),
         ))
     }
 
@@ -382,13 +389,21 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
     where
         <R as Renderer>::TextureId: Clone + 'static,
     {
+        let buffer = data.buffer()?.clone();
+
+        let texture = if let Ok(spb) = crate::wayland::single_pixel_buffer::get_single_pixel_buffer(&buffer) {
+            WaylandSurfaceTexture::SolidColor(Color32F::from(spb.rgba32f()))
+        } else {
+            WaylandSurfaceTexture::Texture(data.texture::<R>(renderer.id())?.clone())
+        };
+
         Some(Self {
             id,
             location,
             alpha,
             kind,
             view: data.view()?,
-            buffer: data.buffer()?.clone(),
+            buffer,
             buffer_scale: data.buffer_scale(),
             buffer_transform: data.buffer_transform(),
             buffer_dimensions: data.buffer_dimensions?,
@@ -397,7 +412,7 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
                 .opaque_regions()
                 .map(OpaqueRegions::from_slice)
                 .unwrap_or_default(),
-            texture: data.texture::<R>(renderer.id())?.clone(),
+            texture,
         })
     }
 
@@ -419,7 +434,7 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
     }
 
     /// Get the buffer texture
-    pub fn texture(&self) -> &R::TextureId {
+    pub fn texture(&self) -> &WaylandSurfaceTexture<R> {
         &self.texture
     }
 }
@@ -532,14 +547,17 @@ where
         damage: &[Rectangle<i32, Physical>],
         opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), R::Error> {
-        frame.render_texture_from_to(
-            &self.texture,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            self.buffer_transform,
-            self.alpha,
-        )
+        match self.texture {
+            WaylandSurfaceTexture::Texture(ref texture) => frame.render_texture_from_to(
+                texture,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                self.buffer_transform,
+                self.alpha,
+            ),
+            WaylandSurfaceTexture::SolidColor(color) => frame.draw_solid(dst, damage, color * self.alpha),
+        }
     }
 }

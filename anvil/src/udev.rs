@@ -1,12 +1,12 @@
 use std::{
-    collections::{hash_map::HashMap, HashSet},
+    collections::hash_map::HashMap,
     io,
     path::Path,
     sync::{atomic::Ordering, Mutex},
     time::{Duration, Instant},
 };
 
-use crate::state::SurfaceDmabufFeedback;
+use crate::state::{DndIcon, SurfaceDmabufFeedback};
 use crate::{
     drawing::*,
     render::*,
@@ -23,6 +23,7 @@ use smithay::{
     backend::{
         allocator::{
             dmabuf::Dmabuf,
+            format::FormatSet,
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
             Fourcc,
         },
@@ -30,13 +31,13 @@ use smithay::{
             compositor::DrmCompositor, CreateDrmNodeError, DrmAccessError, DrmDevice, DrmDeviceFd, DrmError,
             DrmEvent, DrmEventMetadata, DrmNode, DrmSurface, GbmBufferedSurface, NodeType,
         },
-        egl::{self, context::ContextPriority, EGLContext, EGLDevice, EGLDisplay},
+        egl::{self, context::ContextPriority, EGLDevice, EGLDisplay},
         input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
             damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
             element::{memory::MemoryRenderBuffer, AsRenderElements, RenderElement, RenderElementStates},
-            gles::{Capability, GlesRenderer, GlesTexture},
+            gles::{GlesRenderer, GlesTexture},
             multigpu::{gbm::GbmGlesBackend, GpuManager, MultiRenderer},
             sync::SyncPoint,
             Bind, DebugFlags, ExportMem, ImportDma, ImportMemWl, Offscreen, Renderer,
@@ -84,11 +85,12 @@ use smithay::{
         drm_lease::{
             DrmLease, DrmLeaseBuilder, DrmLeaseHandler, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
         },
+        drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjHandler, DrmSyncobjState},
     },
 };
 use smithay_drm_extras::{
+    display_info,
     drm_scanner::{DrmScanEvent, DrmScanner},
-    edid::EdidInfo,
 };
 use tracing::{debug, error, info, trace, warn};
 
@@ -123,6 +125,7 @@ pub struct UdevData {
     pub session: LibSeatSession,
     dh: DisplayHandle,
     dmabuf_state: Option<(DmabufState, DmabufGlobal)>,
+    syncobj_state: Option<DrmSyncobjState>,
     primary_gpu: DrmNode,
     gpus: GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
     backends: HashMap<DrmNode, BackendData>,
@@ -241,22 +244,12 @@ pub fn run_udev() {
     };
     info!("Using {} as primary gpu.", primary_gpu);
 
-    let gpus = GpuManager::new(GbmGlesBackend::with_factory(|egl_display| {
-        let egl_context = EGLContext::new_with_priority(egl_display, ContextPriority::High)?;
-        let disable_color_transform = std::env::var("ANVIL_DISABLE_COLOR_TRANSFORM").is_ok();
-        unsafe {
-            let capabilities = GlesRenderer::supported_capabilities(&egl_context)?
-                .into_iter()
-                .filter(|c| !disable_color_transform || *c != Capability::ColorTransformations);
-
-            Ok(GlesRenderer::with_capabilities(egl_context, capabilities)?)
-        }
-    }))
-    .unwrap();
+    let gpus = GpuManager::new(GbmGlesBackend::with_context_priority(ContextPriority::High)).unwrap();
 
     let data = UdevData {
         dh: display_handle.clone(),
         dmabuf_state: None,
+        syncobj_state: None,
         session,
         primary_gpu,
         gpus,
@@ -390,7 +383,7 @@ pub fn run_udev() {
     #[cfg(feature = "debug")]
     {
         let fps_image =
-            image::io::Reader::with_format(std::io::Cursor::new(FPS_NUMBERS_PNG), image::ImageFormat::Png)
+            image::ImageReader::with_format(std::io::Cursor::new(FPS_NUMBERS_PNG), image::ImageFormat::Png)
                 .decode()
                 .unwrap();
         let fps_texture = renderer
@@ -420,7 +413,7 @@ pub fn run_udev() {
     }
 
     // init dmabuf support with format list from our primary gpu
-    let dmabuf_formats = renderer.dmabuf_formats().collect::<Vec<_>>();
+    let dmabuf_formats = renderer.dmabuf_formats();
     let default_feedback = DmabufFeedbackBuilder::new(primary_gpu.dev_id(), dmabuf_formats)
         .build()
         .unwrap();
@@ -443,6 +436,23 @@ pub fn run_udev() {
             });
         });
     });
+
+    // Expose syncobj protocol if supported by primary GPU
+    if let Some(primary_node) = state
+        .backend_data
+        .primary_gpu
+        .node_with_type(NodeType::Primary)
+        .and_then(|x| x.ok())
+    {
+        if let Some(backend) = state.backend_data.backends.get(&primary_node) {
+            let import_device = backend.drm.device_fd().clone();
+            if supports_syncobj_eventfd(&import_device) {
+                let syncobj_state =
+                    DrmSyncobjState::new::<AnvilState<UdevData>>(&display_handle, import_device);
+                state.backend_data.syncobj_state = Some(syncobj_state);
+            }
+        }
+    }
 
     event_loop
         .handle()
@@ -522,9 +532,24 @@ impl DrmLeaseHandler for AnvilState<UdevData> {
                 builder.add_connector(conn);
                 builder.add_crtc(*crtc);
                 let planes = backend.drm.planes(crtc).map_err(LeaseRejected::with_cause)?;
-                builder.add_plane(planes.primary.handle);
-                if let Some(cursor) = planes.cursor {
-                    builder.add_plane(cursor.handle);
+                let (primary_plane, primary_plane_claim) = planes
+                    .primary
+                    .iter()
+                    .find_map(|plane| {
+                        backend
+                            .drm
+                            .claim_plane(plane.handle, *crtc)
+                            .map(|claim| (plane, claim))
+                    })
+                    .ok_or_else(LeaseRejected::default)?;
+                builder.add_plane(primary_plane.handle, primary_plane_claim);
+                if let Some((cursor, claim)) = planes.cursor.iter().find_map(|plane| {
+                    backend
+                        .drm
+                        .claim_plane(plane.handle, *crtc)
+                        .map(|claim| (plane, claim))
+                }) {
+                    builder.add_plane(cursor.handle, claim);
                 }
             } else {
                 tracing::warn!(?conn, "Lease requested for desktop connector, denying request");
@@ -547,6 +572,13 @@ impl DrmLeaseHandler for AnvilState<UdevData> {
 }
 
 delegate_drm_lease!(AnvilState<UdevData>);
+
+impl DrmSyncobjHandler for AnvilState<UdevData> {
+    fn drm_syncobj_state(&mut self) -> &mut DrmSyncobjState {
+        self.backend_data.syncobj_state.as_mut().unwrap()
+    }
+}
+smithay::delegate_drm_syncobj!(AnvilState<UdevData>);
 
 pub type RenderSurface = GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, Option<OutputPresentationFeedback>>;
 
@@ -770,23 +802,14 @@ fn get_surface_dmabuf_feedback(
     gpus: &mut GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
     composition: &SurfaceComposition,
 ) -> Option<DrmSurfaceDmabufFeedback> {
-    let primary_formats = gpus
-        .single_renderer(&primary_gpu)
-        .ok()?
-        .dmabuf_formats()
-        .collect::<HashSet<_>>();
-
-    let render_formats = gpus
-        .single_renderer(&render_node)
-        .ok()?
-        .dmabuf_formats()
-        .collect::<HashSet<_>>();
+    let primary_formats = gpus.single_renderer(&primary_gpu).ok()?.dmabuf_formats();
+    let render_formats = gpus.single_renderer(&render_node).ok()?.dmabuf_formats();
 
     let all_render_formats = primary_formats
         .iter()
         .chain(render_formats.iter())
         .copied()
-        .collect::<HashSet<_>>();
+        .collect::<FormatSet>();
 
     let surface = composition.surface();
     let planes = surface.planes().clone();
@@ -794,15 +817,16 @@ fn get_surface_dmabuf_feedback(
     // We limit the scan-out tranche to formats we can also render from
     // so that there is always a fallback render path available in case
     // the supplied buffer can not be scanned out directly
-    let planes_formats = planes
-        .primary
+    let planes_formats = surface
+        .plane_info()
         .formats
-        .into_iter()
+        .iter()
+        .copied()
         .chain(planes.overlay.into_iter().flat_map(|p| p.formats))
-        .collect::<HashSet<_>>()
+        .collect::<FormatSet>()
         .intersection(&all_render_formats)
         .copied()
-        .collect::<Vec<_>>();
+        .collect::<FormatSet>();
 
     let builder = DmabufFeedbackBuilder::new(primary_gpu.dev_id(), primary_formats);
     let render_feedback = builder
@@ -932,9 +956,17 @@ impl AnvilState<UdevData> {
             })
             .unwrap_or(false);
 
-        let (make, model) = EdidInfo::for_connector(&device.drm, connector.handle())
-            .map(|info| (info.manufacturer, info.model))
-            .unwrap_or_else(|| ("Unknown".into(), "Unknown".into()));
+        let display_info = display_info::for_connector(&device.drm, connector.handle());
+
+        let make = display_info
+            .as_ref()
+            .and_then(|info| info.make())
+            .unwrap_or_else(|| "Unknown".into());
+
+        let model = display_info
+            .as_ref()
+            .and_then(|info| info.model())
+            .unwrap_or_else(|| "Unknown".into());
 
         if non_desktop {
             info!("Connector {} is non-desktop, setting up for leasing", output_name);
@@ -1134,7 +1166,15 @@ impl AnvilState<UdevData> {
             return;
         };
 
-        for event in device.drm_scanner.scan_connectors(&device.drm) {
+        let scan_result = match device.drm_scanner.scan_connectors(&device.drm) {
+            Ok(scan_result) => scan_result,
+            Err(err) => {
+                tracing::warn!(?err, "Failed to scan connectors");
+                return;
+            }
+        };
+
+        for event in scan_result {
             match event {
                 DrmScanEvent::Connected {
                     connector,
@@ -1554,7 +1594,7 @@ fn render_surface<'a>(
     pointer_location: Point<f64, Logical>,
     pointer_image: &MemoryRenderBuffer,
     pointer_element: &mut PointerElement,
-    dnd_icon: &Option<wl_surface::WlSurface>,
+    dnd_icon: &Option<DndIcon>,
     cursor_status: &mut CursorImageStatus,
     clock: &Clock<Monotonic>,
     show_window_preview: bool,
@@ -1578,8 +1618,7 @@ fn render_surface<'a>(
         } else {
             (0, 0).into()
         };
-        let cursor_pos = pointer_location - output_geometry.loc.to_f64() - cursor_hotspot.to_f64();
-        let cursor_pos_scaled = cursor_pos.to_physical(scale).to_i32_round();
+        let cursor_pos = pointer_location - output_geometry.loc.to_f64();
 
         // set cursor
         pointer_element.set_buffer(pointer_image.clone());
@@ -1598,16 +1637,28 @@ fn render_surface<'a>(
             pointer_element.set_status(cursor_status.clone());
         }
 
-        custom_elements.extend(pointer_element.render_elements(renderer, cursor_pos_scaled, scale, 1.0));
+        custom_elements.extend(
+            pointer_element.render_elements(
+                renderer,
+                (cursor_pos - cursor_hotspot.to_f64())
+                    .to_physical(scale)
+                    .to_i32_round(),
+                scale,
+                1.0,
+            ),
+        );
 
         // draw the dnd icon if applicable
         {
-            if let Some(wl_surface) = dnd_icon.as_ref() {
-                if wl_surface.alive() {
+            if let Some(icon) = dnd_icon.as_ref() {
+                let dnd_icon_pos = (cursor_pos + icon.offset.to_f64())
+                    .to_physical(scale)
+                    .to_i32_round();
+                if icon.surface.alive() {
                     custom_elements.extend(AsRenderElements::<UdevRenderer<'a>>::render_elements(
-                        &SurfaceTree::from_surface(wl_surface),
+                        &SurfaceTree::from_surface(&icon.surface),
                         renderer,
-                        cursor_pos_scaled,
+                        dnd_icon_pos,
                         scale,
                         1.0,
                     ));

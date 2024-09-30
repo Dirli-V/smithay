@@ -278,6 +278,7 @@ where
         + ImportEgl
         + ExportMem
         + 'static,
+    <R as Renderer>::TextureId: Clone + Send,
 {
     fn bind_wl_display(&mut self, display: &wayland_server::DisplayHandle) -> Result<(), EGLError> {
         self.render.renderer_mut().bind_wl_display(display)
@@ -309,12 +310,12 @@ where
                     .find_map(|renderer| Self::try_import_egl(renderer.renderer_mut(), buffer).ok())
             })
         {
-            let texture = MultiTexture::from_surface(surface, dmabuf.size());
+            let texture = MultiTexture::from_surface(surface, dmabuf.size(), dmabuf.format());
             let texture_ref = texture.0.clone();
             let res = self.import_dmabuf_internal(&dmabuf, texture, Some(damage));
             if res.is_ok() {
                 if let Some(surface) = surface {
-                    surface.data_map.insert_if_missing(|| texture_ref);
+                    surface.data_map.insert_if_missing_threadsafe(|| texture_ref);
                 }
             }
             return res;

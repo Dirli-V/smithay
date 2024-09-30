@@ -188,8 +188,8 @@
 mod dispatch;
 
 use std::{
-    collections::{HashMap, HashSet},
-    ffi::CString,
+    collections::HashMap,
+    ffi::CStr,
     ops::Sub,
     os::unix::io::AsFd,
     sync::{
@@ -198,7 +198,7 @@ use std::{
     },
 };
 
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use rustix::fs::{seek, SeekFrom};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::{
     zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
@@ -220,7 +220,7 @@ use crate::{
         dmabuf::{Dmabuf, DmabufFlags, Plane},
         Format, Fourcc, Modifier,
     },
-    utils::{ids::id_gen, sealed_file::SealedFile, UnmanagedResource},
+    utils::{ids::id_gen, SealedFile, UnmanagedResource},
 };
 
 use super::{buffer::BufferHandler, compositor};
@@ -397,7 +397,7 @@ impl DmabufFeedbackBuilder {
             .flat_map(DmabufFeedbackFormat::to_ne_bytes)
             .collect::<Vec<_>>();
 
-        let name = CString::new("smithay-dmabuffeedback-format-table").unwrap();
+        let name = CStr::from_bytes_with_nul(b"smithay-dmabuffeedback-format-table\0").unwrap();
         let format_table_file = SealedFile::with_data(name, &formats)?;
 
         // remove all formats from the main tranche that are already covered
@@ -596,7 +596,11 @@ impl DmabufState {
     ///
     /// Note: This function will create a version 3 dmabuf global and thus not call [`DmabufHandler::new_surface_feedback`],
     /// if you want to create a version 4 global you need to call [`DmabufState::create_global_with_default_feedback`].
-    pub fn create_global<D>(&mut self, display: &DisplayHandle, formats: Vec<Format>) -> DmabufGlobal
+    pub fn create_global<D>(
+        &mut self,
+        display: &DisplayHandle,
+        formats: impl IntoIterator<Item = Format>,
+    ) -> DmabufGlobal
     where
         D: GlobalDispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, DmabufGlobalData>
             + BufferHandler
@@ -617,7 +621,7 @@ impl DmabufState {
     pub fn create_global_with_filter<D, F>(
         &mut self,
         display: &DisplayHandle,
-        formats: Vec<Format>,
+        formats: impl IntoIterator<Item = Format>,
         filter: F,
     ) -> DmabufGlobal
     where
@@ -627,6 +631,7 @@ impl DmabufState {
             + 'static,
         F: for<'c> Fn(&'c Client) -> bool + Send + Sync + 'static,
     {
+        let formats = formats.into_iter().collect::<Vec<_>>();
         self.create_global_with_filter_and_optional_default_feedback::<D, _>(
             display,
             Some(formats),
@@ -694,19 +699,19 @@ impl DmabufState {
             + 'static,
         F: for<'c> Fn(&'c Client) -> bool + Send + Sync + 'static,
     {
-        let id = next_global_id();
+        let id = global_id::next();
 
         let formats = formats
             .or_else(|| default_feedback.map(|f| f.main_formats()))
             .unwrap()
             .into_iter()
             .fold(
-                HashMap::<Fourcc, HashSet<Modifier>>::new(),
+                IndexMap::<Fourcc, IndexSet<Modifier>>::new(),
                 |mut formats, format| {
                     if let Some(modifiers) = formats.get_mut(&format.code) {
                         modifiers.insert(format.modifier);
                     } else {
-                        formats.insert(format.code, HashSet::from_iter(std::iter::once(format.modifier)));
+                        formats.insert(format.code, IndexSet::from_iter(std::iter::once(format.modifier)));
                     }
                     formats
                 },
@@ -780,7 +785,7 @@ impl DmabufState {
     /// It is highly recommended you disable the global before destroying it and ensure all child objects have
     /// been destroyed.
     pub fn destroy_global<D: 'static>(&mut self, display: &DisplayHandle, global: DmabufGlobal) {
-        if DMABUF_GLOBAL_IDS.lock().unwrap().remove(&global.id) {
+        if global_id::remove(global.id) {
             if let Some(global_state) = self.globals.remove(&global.id) {
                 display.remove_global::<D>(global_state.id);
             }
@@ -792,7 +797,7 @@ impl DmabufState {
 #[allow(missing_debug_implementations)]
 pub struct DmabufGlobalData {
     filter: Box<dyn for<'c> Fn(&'c Client) -> bool + Send + Sync>,
-    formats: Arc<HashMap<Fourcc, HashSet<Modifier>>>,
+    formats: Arc<IndexMap<Fourcc, IndexSet<Modifier>>>,
     default_feedback: Option<Arc<Mutex<DmabufFeedback>>>,
     known_default_feedbacks:
         Arc<Mutex<Vec<wayland_server::Weak<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1>>>>,
@@ -802,7 +807,7 @@ pub struct DmabufGlobalData {
 /// Data associated with a dmabuf global protocol object.
 #[derive(Debug)]
 pub struct DmabufData {
-    formats: Arc<HashMap<Fourcc, HashSet<Modifier>>>,
+    formats: Arc<IndexMap<Fourcc, IndexSet<Modifier>>>,
     id: usize,
 
     default_feedback: Option<Arc<Mutex<DmabufFeedback>>>,
@@ -827,7 +832,7 @@ pub struct DmabufParamsData {
     /// Whether the params protocol object has been used before to create a wl_buffer.
     used: AtomicBool,
 
-    formats: Arc<HashMap<Fourcc, HashSet<Modifier>>>,
+    formats: Arc<IndexMap<Fourcc, IndexSet<Modifier>>>,
 
     /// Pending planes for the params.
     modifier: Mutex<Option<Modifier>>,
@@ -1229,4 +1234,4 @@ impl DmabufParamsData {
     }
 }
 
-id_gen!(next_global_id, DMABUF_GLOBAL_ID, DMABUF_GLOBAL_IDS);
+id_gen!(global_id);

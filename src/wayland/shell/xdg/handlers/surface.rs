@@ -121,7 +121,7 @@ where
                 });
 
                 if initial {
-                    compositor::add_pre_commit_hook::<D, _>(
+                    compositor::add_post_commit_hook::<D, _>(
                         surface,
                         super::super::ToplevelSurface::commit_hook,
                     );
@@ -199,7 +199,14 @@ where
                 });
 
                 if initial {
-                    compositor::add_pre_commit_hook::<D, _>(surface, super::super::PopupSurface::commit_hook);
+                    compositor::add_pre_commit_hook::<D, _>(
+                        surface,
+                        super::super::PopupSurface::pre_commit_hook,
+                    );
+                    compositor::add_post_commit_hook::<D, _>(
+                        surface,
+                        super::super::PopupSurface::post_commit_hook,
+                    );
                 }
 
                 let popup = data_init.init(
@@ -247,7 +254,7 @@ where
                 }
 
                 compositor::with_states(surface, |states| {
-                    states.cached_state.pending::<SurfaceCachedState>().geometry =
+                    states.cached_state.get::<SurfaceCachedState>().pending().geometry =
                         Some(Rectangle::from_loc_and_size((x, y), (width, height)));
                 });
             }

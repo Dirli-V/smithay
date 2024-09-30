@@ -1,15 +1,18 @@
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::backend::input::{ButtonState, TabletToolCapabilities, TabletToolDescriptor, TabletToolType};
 use crate::input::pointer::{CursorImageAttributes, CursorImageStatus};
-use crate::utils::{Logical, Point};
+use crate::utils::{Client as ClientCoords, Logical, Point};
+use crate::wayland::compositor::CompositorHandler;
 use crate::wayland::seat::CURSOR_IMAGE_ROLE;
 use wayland_protocols::wp::tablet::zv2::server::{
     zwp_tablet_seat_v2::ZwpTabletSeatV2,
     zwp_tablet_tool_v2::{self, ZwpTabletToolV2},
 };
 use wayland_server::protocol::wl_surface::WlSurface;
+use wayland_server::Weak;
 use wayland_server::{backend::ClientId, Client, DataInit, Dispatch, DisplayHandle, Resource};
 
 use crate::{utils::Serial, wayland::compositor};
@@ -20,7 +23,7 @@ use super::TabletManagerState;
 
 #[derive(Debug, Default)]
 pub(crate) struct TabletTool {
-    instances: Vec<ZwpTabletToolV2>,
+    instances: Vec<Weak<ZwpTabletToolV2>>,
     pub(crate) focus: Option<WlSurface>,
 
     is_down: bool,
@@ -37,18 +40,23 @@ impl TabletTool {
     fn proximity_in(
         &mut self,
         loc: Point<f64, Logical>,
-        (focus, sloc): (WlSurface, Point<i32, Logical>),
+        (focus, sloc): (WlSurface, Point<f64, Logical>),
         tablet: &TabletHandle,
         serial: Serial,
         time: u32,
     ) {
         let wl_tool = self.instances.iter().find(|i| i.id().same_client_as(&focus.id()));
 
-        if let Some(wl_tool) = wl_tool {
+        if let Some(wl_tool) = wl_tool.and_then(|tool| tool.upgrade().ok()) {
             tablet.with_focused_tablet(&focus, |wl_tablet| {
                 wl_tool.proximity_in(serial.into(), wl_tablet, &focus);
                 // proximity_in has to be followed by motion event (required by protocol)
-                let srel_loc = loc - sloc.to_f64();
+                let client_scale = wl_tool
+                    .data::<TabletToolUserData>()
+                    .unwrap()
+                    .client_scale
+                    .load(Ordering::Acquire);
+                let srel_loc = (loc - sloc).to_client(client_scale as f64);
                 wl_tool.motion(srel_loc.x, srel_loc.y);
                 wl_tool.frame(time);
             });
@@ -61,7 +69,7 @@ impl TabletTool {
         if let Some(ref focus) = self.focus {
             let wl_tool = self.instances.iter().find(|i| i.id().same_client_as(&focus.id()));
 
-            if let Some(wl_tool) = wl_tool {
+            if let Some(wl_tool) = wl_tool.and_then(|tool| tool.upgrade().ok()) {
                 if self.is_down {
                     wl_tool.up();
                     self.is_down = false;
@@ -76,7 +84,12 @@ impl TabletTool {
 
     fn tip_down(&mut self, serial: Serial, time: u32) {
         if let Some(ref focus) = self.focus {
-            if let Some(wl_tool) = self.instances.iter().find(|i| i.id().same_client_as(&focus.id())) {
+            if let Some(wl_tool) = self
+                .instances
+                .iter()
+                .find(|i| i.id().same_client_as(&focus.id()))
+                .and_then(|tool| tool.upgrade().ok())
+            {
                 if !self.is_down {
                     wl_tool.down(serial.into());
                     wl_tool.frame(time);
@@ -89,7 +102,12 @@ impl TabletTool {
 
     fn tip_up(&mut self, time: u32) {
         if let Some(ref focus) = self.focus {
-            if let Some(wl_tool) = self.instances.iter().find(|i| i.id().same_client_as(&focus.id())) {
+            if let Some(wl_tool) = self
+                .instances
+                .iter()
+                .find(|i| i.id().same_client_as(&focus.id()))
+                .and_then(|tool| tool.upgrade().ok())
+            {
                 if self.is_down {
                     wl_tool.up();
                     wl_tool.frame(time);
@@ -103,7 +121,7 @@ impl TabletTool {
     fn motion(
         &mut self,
         pos: Point<f64, Logical>,
-        focus: Option<(WlSurface, Point<i32, Logical>)>,
+        focus: Option<(WlSurface, Point<f64, Logical>)>,
         tablet: &TabletHandle,
         serial: Serial,
         time: u32,
@@ -115,8 +133,14 @@ impl TabletTool {
                         .instances
                         .iter()
                         .find(|i| i.id().same_client_as(&focus.0.id()))
+                        .and_then(|tool| tool.upgrade().ok())
                     {
-                        let srel_loc = pos - focus.1.to_f64();
+                        let client_scale = wl_tool
+                            .data::<TabletToolUserData>()
+                            .unwrap()
+                            .client_scale
+                            .load(Ordering::Acquire);
+                        let srel_loc = (pos - focus.1).to_client(client_scale as f64);
                         wl_tool.motion(srel_loc.x, srel_loc.y);
 
                         if let Some(pressure) = self.pending_pressure.take() {
@@ -188,7 +212,12 @@ impl TabletTool {
     /// Sent whenever a button on the tool is pressed or released.
     fn button(&self, button: u32, state: ButtonState, serial: Serial, time: u32) {
         if let Some(ref focus) = self.focus {
-            if let Some(wl_tool) = self.instances.iter().find(|i| i.id().same_client_as(&focus.id())) {
+            if let Some(wl_tool) = self
+                .instances
+                .iter()
+                .find(|i| i.id().same_client_as(&focus.id()))
+                .and_then(|tool| tool.upgrade().ok())
+            {
                 wl_tool.button(serial.into(), button, state.into());
                 wl_tool.frame(time);
             }
@@ -198,7 +227,7 @@ impl TabletTool {
 
 impl Drop for TabletTool {
     fn drop(&mut self) {
-        for instance in self.instances.iter() {
+        for instance in self.instances.iter().filter_map(|tool| tool.upgrade().ok()) {
             // This event is sent when the tool is removed from the system and will send no further events.
             instance.removed();
         }
@@ -218,6 +247,7 @@ pub struct TabletToolHandle {
 impl TabletToolHandle {
     pub(super) fn new_instance<D>(
         &mut self,
+        state: &mut D,
         client: &Client,
         dh: &DisplayHandle,
         seat: &ZwpTabletSeatV2,
@@ -225,9 +255,11 @@ impl TabletToolHandle {
     ) where
         D: Dispatch<ZwpTabletToolV2, TabletToolUserData>,
         D: TabletSeatHandler + 'static,
+        D: CompositorHandler,
     {
         let desc = tool.clone();
 
+        let client_scale = state.client_compositor_state(client).clone_client_scale();
         let wl_tool = client
             .create_resource::<ZwpTabletToolV2, _, D>(
                 dh,
@@ -235,6 +267,7 @@ impl TabletToolHandle {
                 TabletToolUserData {
                     handle: self.clone(),
                     desc,
+                    client_scale,
                 },
             )
             .unwrap();
@@ -277,7 +310,7 @@ impl TabletToolHandle {
         }
 
         wl_tool.done();
-        self.inner.lock().unwrap().instances.push(wl_tool);
+        self.inner.lock().unwrap().instances.push(wl_tool.downgrade());
     }
 
     /// Notify that this tool is focused on a certain surface.
@@ -290,7 +323,7 @@ impl TabletToolHandle {
     pub fn proximity_in(
         &self,
         pos: Point<f64, Logical>,
-        focus: (WlSurface, Point<i32, Logical>),
+        focus: (WlSurface, Point<f64, Logical>),
         tablet: &TabletHandle,
         serial: Serial,
         time: u32,
@@ -330,7 +363,7 @@ impl TabletToolHandle {
     pub fn motion(
         &self,
         pos: Point<f64, Logical>,
-        focus: Option<(WlSurface, Point<i32, Logical>)>,
+        focus: Option<(WlSurface, Point<f64, Logical>)>,
         tablet: &TabletHandle,
         serial: Serial,
         time: u32,
@@ -419,6 +452,7 @@ impl From<ButtonState> for zwp_tablet_tool_v2::ButtonState {
 pub struct TabletToolUserData {
     pub(crate) handle: TabletToolHandle,
     pub(crate) desc: TabletToolDescriptor,
+    client_scale: Arc<AtomicU32>,
 }
 
 impl fmt::Debug for TabletToolUserData {
@@ -426,7 +460,7 @@ impl fmt::Debug for TabletToolUserData {
         f.debug_struct("TabletToolUserData")
             .field("handle", &self.handle)
             .field("desc", &self.desc)
-            .field("cb", &"...")
+            .field("client_scale", &self.client_scale)
             .finish()
     }
 }
@@ -474,13 +508,20 @@ where
                                         hotspot: (0, 0).into(),
                                     })
                                 });
+                                let client_scale = tool
+                                    .data::<TabletToolUserData>()
+                                    .unwrap()
+                                    .client_scale
+                                    .load(Ordering::Acquire);
+                                let hotspot = Point::<_, ClientCoords>::from((hotspot_x, hotspot_y))
+                                    .to_logical(client_scale as i32);
                                 states
                                     .data_map
                                     .get::<Mutex<CursorImageAttributes>>()
                                     .unwrap()
                                     .lock()
                                     .unwrap()
-                                    .hotspot = (hotspot_x, hotspot_y).into();
+                                    .hotspot = hotspot;
                             });
 
                             state.tablet_tool_image(&data.desc, CursorImageStatus::Surface(surface));

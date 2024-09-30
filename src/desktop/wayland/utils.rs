@@ -5,7 +5,7 @@ use crate::{
         element::{
             PrimaryScanoutOutput, RenderElementPresentationState, RenderElementState, RenderElementStates,
         },
-        utils::RendererSurfaceState,
+        utils::{RendererSurfaceState, RendererSurfaceStateUserData},
     },
     desktop::WindowSurfaceType,
     output::{Output, WeakOutput},
@@ -69,9 +69,9 @@ where
         location,
         |_, states, loc: &Point<i32, Logical>| {
             let mut loc = *loc;
-            let data = states.data_map.get::<RefCell<RendererSurfaceState>>();
+            let data = states.data_map.get::<RendererSurfaceStateUserData>();
 
-            if let Some(surface_view) = data.and_then(|d| d.borrow().surface_view) {
+            if let Some(surface_view) = data.and_then(|d| d.lock().unwrap().surface_view) {
                 loc += surface_view.offset;
                 // Update the bounding box.
                 bounding_box = bounding_box.merge(Rectangle::from_loc_and_size(loc, surface_view.dst));
@@ -110,9 +110,9 @@ where
         location.into(),
         |_, states, location: &Point<i32, Logical>| {
             let mut location = *location;
-            let data = states.data_map.get::<RefCell<RendererSurfaceState>>();
+            let data = states.data_map.get::<RendererSurfaceStateUserData>();
 
-            if let Some(surface_view) = data.and_then(|d| d.borrow().surface_view) {
+            if let Some(surface_view) = data.and_then(|d| d.lock().unwrap().surface_view) {
                 location += surface_view.offset;
                 if surface_type.contains(WindowSurfaceType::SUBSURFACE) {
                     TraversalAction::DoChildren(location)
@@ -126,15 +126,16 @@ where
         },
         |wl_surface, states, location: &Point<i32, Logical>| {
             let mut location = *location;
-            let data = states.data_map.get::<RefCell<RendererSurfaceState>>();
+            let data = states.data_map.get::<RendererSurfaceStateUserData>();
 
-            if let Some(surface_view) = data.and_then(|d| d.borrow().surface_view) {
+            if let Some(surface_view) = data.and_then(|d| d.lock().unwrap().surface_view) {
                 location += surface_view.offset;
 
                 let contains_the_point = data
                     .map(|data| {
-                        data.borrow()
-                            .contains_point(&states.cached_state.current(), point - location.to_f64())
+                        data.lock()
+                            .unwrap()
+                            .contains_point(&*states.cached_state.get().current(), point - location.to_f64())
                     })
                     .unwrap_or(false);
                 if contains_the_point {
@@ -256,7 +257,8 @@ pub fn send_frames_surface_tree<T, F>(
                 // yet been commited
                 for callback in states
                     .cached_state
-                    .current::<SurfaceAttributes>()
+                    .get::<SurfaceAttributes>()
+                    .current()
                     .frame_callbacks
                     .drain(..)
                 {
@@ -318,8 +320,8 @@ impl SurfacePresentationFeedback {
     ///
     /// Returns `None` if the surface has no stored presentation feedback
     pub fn from_states(states: &SurfaceData, flags: wp_presentation_feedback::Kind) -> Option<Self> {
-        let mut presentation_feedback_state =
-            states.cached_state.current::<PresentationFeedbackCachedState>();
+        let mut guard = states.cached_state.get::<PresentationFeedbackCachedState>();
+        let presentation_feedback_state = guard.current();
         if presentation_feedback_state.callbacks.is_empty() {
             return None;
         }

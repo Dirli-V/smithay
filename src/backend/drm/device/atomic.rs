@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, RwLock,
 };
 
 use drm::control::atomic::AtomicModeReq;
@@ -23,17 +23,69 @@ type OldState = (
     Vec<(plane::Handle, PropertyValueSet)>,
 );
 
-pub type Mapping = (
-    HashMap<connector::Handle, HashMap<String, property::Handle>>,
-    HashMap<crtc::Handle, HashMap<String, property::Handle>>,
-    HashMap<plane::Handle, HashMap<String, property::Handle>>,
-);
+#[derive(Clone, Debug, Default)]
+pub struct PropMapping {
+    pub connectors: HashMap<connector::Handle, HashMap<String, property::Handle>>,
+    pub crtcs: HashMap<crtc::Handle, HashMap<String, property::Handle>>,
+    pub planes: HashMap<plane::Handle, HashMap<String, property::Handle>>,
+}
+
+impl PropMapping {
+    pub(crate) fn conn_prop_handle(
+        &self,
+        handle: connector::Handle,
+        name: &'static str,
+    ) -> Result<property::Handle, Error> {
+        self.connectors
+            .get(&handle)
+            .expect("Unknown handle")
+            .get(name)
+            .ok_or_else(|| Error::UnknownProperty {
+                handle: handle.into(),
+                name,
+            })
+            .copied()
+    }
+
+    pub(crate) fn crtc_prop_handle(
+        &self,
+        handle: crtc::Handle,
+        name: &'static str,
+    ) -> Result<property::Handle, Error> {
+        self.crtcs
+            .get(&handle)
+            .expect("Unknown handle")
+            .get(name)
+            .ok_or_else(|| Error::UnknownProperty {
+                handle: handle.into(),
+                name,
+            })
+            .copied()
+    }
+
+    pub(crate) fn plane_prop_handle(
+        &self,
+        handle: plane::Handle,
+        name: &'static str,
+    ) -> Result<property::Handle, Error> {
+        self.planes
+            .get(&handle)
+            .expect("Unknown handle")
+            .get(name)
+            .ok_or_else(|| Error::UnknownProperty {
+                handle: handle.into(),
+                name,
+            })
+            .copied()
+    }
+}
+
 #[derive(Debug)]
 pub struct AtomicDrmDevice {
     pub(crate) fd: DrmDeviceFd,
     pub(crate) active: Arc<AtomicBool>,
     old_state: OldState,
-    pub(crate) prop_mapping: Mapping,
+    pub(crate) prop_mapping: Arc<RwLock<PropMapping>>,
     pub(super) span: tracing::Span,
 }
 
@@ -44,7 +96,7 @@ impl AtomicDrmDevice {
             fd,
             active,
             old_state: (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-            prop_mapping: (HashMap::new(), HashMap::new(), HashMap::new()),
+            prop_mapping: Default::default(),
             span,
         };
         let _guard = dev.span.enter();
@@ -67,7 +119,7 @@ impl AtomicDrmDevice {
         })?;
 
         let mut old_state = dev.old_state.clone();
-        let mut mapping = dev.prop_mapping.clone();
+        let mut mapping = dev.prop_mapping.write().unwrap();
 
         // This helper function takes a snapshot of the current device properties.
         // (everything in the atomic api is set via properties.)
@@ -79,13 +131,14 @@ impl AtomicDrmDevice {
         // And because the mapping is not consistent across devices,
         // we also need to lookup the handle for a property name.
         // And we do this a fair bit, so lets cache that mapping.
-        map_props(&dev.fd, res_handles.connectors(), &mut mapping.0)?;
-        map_props(&dev.fd, res_handles.crtcs(), &mut mapping.1)?;
-        map_props(&dev.fd, &planes, &mut mapping.2)?;
+        map_props(&dev.fd, res_handles.connectors(), &mut mapping.connectors)?;
+        map_props(&dev.fd, res_handles.crtcs(), &mut mapping.crtcs)?;
+        map_props(&dev.fd, &planes, &mut mapping.planes)?;
 
         dev.old_state = old_state;
-        dev.prop_mapping = mapping;
-        trace!("Mapping: {:#?}", dev.prop_mapping);
+        trace!("Mapping: {:#?}", mapping);
+
+        drop(mapping);
 
         // If the user does not explicitly requests us to skip this,
         // we clear out the complete connector<->crtc mapping on device creation.
@@ -130,57 +183,43 @@ impl AtomicDrmDevice {
             })
         })?;
 
+        let mut prop_mapping = self.prop_mapping.write().unwrap();
+
+        // Make sure the mapping is up to date
+        prop_mapping.connectors.clear();
+        map_props(&self.fd, res_handles.connectors(), &mut prop_mapping.connectors)?;
+
         // Disable all connectors (otherwise we might run into conflicting commits when restarting the rendering loop)
         let mut req = AtomicModeReq::new();
         for conn in res_handles.connectors() {
-            let prop = self
-                .prop_mapping
-                .0
-                .get(conn)
-                .expect("Unknown handle")
-                .get("CRTC_ID")
+            let prop = prop_mapping
+                .conn_prop_handle(*conn, "CRTC_ID")
                 .expect("Unknown property CRTC_ID");
-            req.add_property(*conn, *prop, property::Value::CRTC(None));
+            req.add_property(*conn, prop, property::Value::CRTC(None));
         }
         // Disable all planes
         for plane in plane_handles {
-            let prop = self
-                .prop_mapping
-                .2
-                .get(&plane)
-                .expect("Unknown handle")
-                .get("CRTC_ID")
+            let prop = prop_mapping
+                .plane_prop_handle(plane, "CRTC_ID")
                 .expect("Unknown property CRTC_ID");
-            req.add_property(plane, *prop, property::Value::CRTC(None));
+            req.add_property(plane, prop, property::Value::CRTC(None));
 
-            let prop = self
-                .prop_mapping
-                .2
-                .get(&plane)
-                .expect("Unknown handle")
-                .get("FB_ID")
+            let prop = prop_mapping
+                .plane_prop_handle(plane, "FB_ID")
                 .expect("Unknown property FB_ID");
-            req.add_property(plane, *prop, property::Value::Framebuffer(None));
+            req.add_property(plane, prop, property::Value::Framebuffer(None));
         }
         // A crtc without a connector has no mode, we also need to reset that.
         // Otherwise the commit will not be accepted.
         for crtc in res_handles.crtcs() {
-            let mode_prop = self
-                .prop_mapping
-                .1
-                .get(crtc)
-                .expect("Unknown handle")
-                .get("MODE_ID")
+            let mode_prop = prop_mapping
+                .crtc_prop_handle(*crtc, "MODE_ID")
                 .expect("Unknown property MODE_ID");
-            let active_prop = self
-                .prop_mapping
-                .1
-                .get(crtc)
-                .expect("Unknown handle")
-                .get("ACTIVE")
+            let active_prop = prop_mapping
+                .crtc_prop_handle(*crtc, "ACTIVE")
                 .expect("Unknown property ACTIVE");
-            req.add_property(*crtc, *active_prop, property::Value::Boolean(false));
-            req.add_property(*crtc, *mode_prop, property::Value::Unknown(0));
+            req.add_property(*crtc, active_prop, property::Value::Boolean(false));
+            req.add_property(*crtc, mode_prop, property::Value::Unknown(0));
         }
         self.fd
             .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)

@@ -107,20 +107,21 @@
 
 mod cache;
 mod handlers;
-mod hook;
 mod transaction;
 mod tree;
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::{any::Any, sync::Mutex};
 
 pub use self::cache::{Cacheable, MultiCache};
 pub use self::handlers::{RegionUserData, SubsurfaceCachedState, SubsurfaceUserData, SurfaceUserData};
-pub use self::hook::HookId;
 use self::transaction::TransactionQueue;
 pub use self::transaction::{Blocker, BlockerState};
 pub use self::tree::{AlreadyHasRole, TraversalAction};
 use self::tree::{PrivateSurfaceData, SuggestedSurfaceState};
+pub use crate::utils::hook::HookId;
 use crate::utils::Transform;
 use crate::utils::{user_data::UserDataMap, Buffer, Logical, Point, Rectangle};
 use wayland_server::backend::GlobalId;
@@ -142,11 +143,6 @@ pub enum Damage {
     ///
     /// Note: Buffer scaling must be taken into consideration
     Buffer(Rectangle<i32, Buffer>),
-}
-
-#[derive(Debug, Copy, Clone, Default)]
-struct Marker<R> {
-    _r: ::std::marker::PhantomData<R>,
 }
 
 /// The state container associated with a surface
@@ -249,6 +245,8 @@ pub struct SurfaceAttributes {
     /// An example possibility would be to trigger it once the frame
     /// associated with this commit has been displayed on the screen.
     pub frame_callbacks: Vec<wl_callback::WlCallback>,
+
+    pub(crate) client_scale: u32,
 }
 
 impl Default for SurfaceAttributes {
@@ -262,6 +260,7 @@ impl Default for SurfaceAttributes {
             input_region: None,
             damage: Vec::new(),
             frame_callbacks: Vec::new(),
+            client_scale: 1,
         }
     }
 }
@@ -443,6 +442,12 @@ pub fn get_region_attributes(region: &wl_region::WlRegion) -> RegionAttributes {
 /// Register a pre-commit hook to be invoked on surface commit
 ///
 /// It'll be invoked on surface commit, *before* the new state is merged into the current state.
+///
+/// Protocol implementations should use this for error checking, but they should **not** apply
+/// state changes here, since the commit may be further arbitrarily delayed by blockers. Use a
+/// post-commit hook to apply state changes (i.e. copy last acked state to current).
+///
+/// Compositors should use this for adding blockers if needed, e.g. the DMA-BUF readiness blocker.
 pub fn add_pre_commit_hook<D, F>(surface: &WlSurface, hook: F) -> HookId
 where
     F: Fn(&mut D, &DisplayHandle, &WlSurface) + Send + Sync + 'static,
@@ -466,7 +471,11 @@ where
 
 /// Register a post-commit hook to be invoked on surface commit
 ///
-/// It'll be invoked on surface commit, *after* the new state is merged into the current state.
+/// It'll be invoked on surface commit, *after* the new state is merged into the current state,
+/// after all commit blockers complete.
+///
+/// Protocol implementations should apply state changes here, i.e. copy last acked state into
+/// current.
 pub fn add_post_commit_hook<D, F>(surface: &WlSurface, hook: F) -> HookId
 where
     F: Fn(&mut D, &DisplayHandle, &WlSurface) + Send + Sync + 'static,
@@ -601,9 +610,19 @@ pub struct CompositorState {
 }
 
 /// Per-client state of a compositor
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CompositorClientState {
     queue: Mutex<Option<TransactionQueue>>,
+    scale_override: Arc<AtomicU32>,
+}
+
+impl Default for CompositorClientState {
+    fn default() -> Self {
+        CompositorClientState {
+            queue: Mutex::new(None),
+            scale_override: Arc::new(AtomicU32::new(1)),
+        }
+    }
 }
 
 impl CompositorClientState {
@@ -620,6 +639,32 @@ impl CompositorClientState {
         for transaction in transactions {
             transaction.apply(dh, state)
         }
+    }
+
+    /// Set an additionally mapping between smithay's `Logical` coordinate space
+    /// and this clients logical coordinate space.
+    ///
+    /// This is used in the same way as if the client was setting the
+    /// surface.buffer_scale on every surface i.e a value of 2.0 will make
+    /// the windows appear smaller on a regular DPI monitor.
+    ///
+    /// Only the minimal set of protocols used by xwayland are guaranteed to be supported.
+    ///
+    /// Buffer sizes are unaffected.
+    pub fn set_client_scale(&self, new_scale: u32) {
+        self.scale_override.store(new_scale, Ordering::Release);
+    }
+
+    /// Get the scale factor of the additional mapping between smithay's `Logical`
+    /// coordinate space and this clients logical coordinate space.
+    ///
+    /// This is mainly intended to support out-of-tree protocol implementations.
+    pub fn client_scale(&self) -> u32 {
+        self.scale_override.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn clone_client_scale(&self) -> Arc<AtomicU32> {
+        self.scale_override.clone()
     }
 }
 
